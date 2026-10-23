@@ -203,6 +203,9 @@ void Test_PartitionSearch()
 }
 void Win_DoUnitTests()
 {
+#if ENABLE_DRIVER_MIOT
+	Test_MIoT();
+#endif
 	Test_LEDstrips();
 
 	// SELFTEST_ASSERT_EXPRESSION("sqrt(4)", 2)

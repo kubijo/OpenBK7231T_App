@@ -85,6 +85,7 @@ void Test_ClockEvents();
 void Test_Commands_Channels();
 void Test_LEDDriver();
 void Test_TuyaMCU_Basic();
+void Test_MIoT(void);
 void Test_TuyaMCU_Calib();
 void Test_TuyaMCU_Boolean();
 void Test_TuyaMCU_DP22();
