@@ -18,6 +18,7 @@
 #include "drv_tuyaMCU.h"
 #include "drv_girierMCU.h"
 #include "drv_uart.h"
+#include "drv_miot.h"
 #include "drv_gaitekAC.h"
 #include "drv_ds1820_simple.h"
 #include "drv_ds1820_full.h"
@@ -52,6 +53,22 @@ void GirierMCU_RunEverySecond();
 
 // startDriver BL0937
 static driver_t g_drivers[] = {
+#if ENABLE_DRIVER_MIOT
+	//drvdetail:{"name":"MIoT",
+	//drvdetail:"title":"MIoT serial MCU",
+	//drvdetail:"descr":"Xiaomi ASCII serial MCU transport with typed property-to-channel mappings.",
+	//drvdetail:"requires":""}
+	{ "MIoT",                                // Driver Name
+	MIoT_Init,                               // Init
+	MIoT_RunEverySecond,                     // onEverySecond
+	NULL,                                    // appendInformationToHTTPIndexPage
+	MIoT_RunFrame,                           // runQuickTick
+	MIoT_Stop,                               // stopFunction
+	MIoT_OnChannelChanged,                   // onChannelChanged
+	NULL,                                    // onHassDiscovery
+	false,                                   // loaded
+	},
+#endif
 #if ENABLE_DRIVER_TUYAMCU
 	//drvdetail:{"name":"TuyaMCU",
 	//drvdetail:"title":"TODO",

@@ -143,6 +143,8 @@
 
 #elif WINDOWS
 
+#define ENABLE_DRIVER_MIOT					1
+
 #if LINUX
 
 #else
@@ -223,6 +225,8 @@
 //#define ENABLE_DRIVER_ARISTON					1
 
 #elif PLATFORM_BL602
+
+#define ENABLE_DRIVER_MIOT					1
 
 // #define ENABLE_SEND_POSTANDGET				1
 #define ENABLE_HA_DISCOVERY 					1

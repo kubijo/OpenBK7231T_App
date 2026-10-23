@@ -1,0 +1,426 @@
+// Xiaomi module-side MIoT serial transport. Lines are ASCII, terminated by CR.
+#include "drv_miot.h"
+#include "../cmnds/cmd_public.h"
+#include "../hal/hal_wifi.h"
+#include "../logging/logging.h"
+#include "../new_cfg.h"
+#include "../new_common.h"
+#include "../new_pins.h"
+#include "../quicktick.h"
+#include "drv_ntp.h"
+#include "drv_uart.h"
+#include <errno.h>
+#include <limits.h>
+
+#if ENABLE_DRIVER_MIOT
+
+#define MIOT_PROPERTIES 16
+#define MIOT_QUEUE 16
+#define MIOT_LINE 512
+#define MIOT_TOKENS 128
+#define MIOT_TIMEOUT 3000U
+
+typedef struct {
+	int siid, piid, channel, min, max, step;
+	bool boolean, writable, known, read;
+	int value;
+} miotProperty_t;
+
+typedef struct {
+	int property, value;
+} miotWrite_t;
+
+typedef enum { MIOT_IDLE,
+			   MIOT_WRITE,
+			   MIOT_READ } miotPending_t;
+
+static miotProperty_t properties[MIOT_PROPERTIES];
+static int propertyCount;
+static miotWrite_t writes[MIOT_QUEUE];
+static int queueHead, queueCount;
+static miotPending_t pending;
+static int pendingProperty;
+static unsigned int pendingSince, lastByte;
+static int uartGeneration;
+static bool running, dropping;
+static int applyingChannel = -1;
+static char line[MIOT_LINE + 1];
+static size_t lineLength;
+static unsigned int pollSeconds;
+
+static bool MIoT_Int(const char *text, int *value) {
+	char *end;
+	long number;
+	if (!text || !*text || (*text != '-' && !isdigit((unsigned char)*text)))
+		return false;
+	errno = 0;
+	number = strtol(text, &end, 10);
+	if (*end || errno == ERANGE || number < INT_MIN || number > INT_MAX)
+		return false;
+	*value = (int)number;
+	return true;
+}
+
+// A bounded tokenizer is independent of the global command tokenizer, including
+// when channel updates invoke scripts while a UART message is being processed.
+static int MIoT_Tokenize(char *text, char **tokens, int capacity) {
+	int count = 0;
+	while (*text) {
+		while (*text == ' ' || *text == '\t')
+			text++;
+		if (!*text)
+			break;
+		if (count == capacity)
+			return -1;
+		tokens[count++] = text;
+		while (*text && *text != ' ' && *text != '\t')
+			text++;
+		if (*text)
+			*text++ = 0;
+	}
+	return count;
+}
+
+static int MIoT_Find(int siid, int piid) {
+	int i;
+	for (i = 0; i < propertyCount; i++)
+		if (properties[i].siid == siid && properties[i].piid == piid)
+			return i;
+	return -1;
+}
+
+static void MIoT_Send(const char *text) {
+	while (*text)
+		UART_SendByte((byte)*text++);
+	UART_SendByte('\r');
+}
+
+static void MIoT_ReadAll(void) {
+	int i;
+	for (i = 0; i < propertyCount; i++)
+		properties[i].read = true;
+}
+
+static void MIoT_ResetSession(void) {
+	int i;
+	queueHead = queueCount = 0;
+	pending = MIOT_IDLE;
+	for (i = 0; i < propertyCount; i++)
+		properties[i].known = false;
+	MIoT_ReadAll();
+}
+
+static bool MIoT_Value(int index, const char *text, int *value) {
+	miotProperty_t *p = &properties[index];
+	if (p->boolean) {
+		if (!strcmp(text, "true"))
+			*value = 1;
+		else if (!strcmp(text, "false"))
+			*value = 0;
+		else
+			return false;
+	} else if (!MIoT_Int(text, value))
+		return false;
+	return *value >= p->min && *value <= p->max;
+}
+
+static void MIoT_Apply(int index, int value) {
+	miotProperty_t *p = &properties[index];
+	int previous = applyingChannel;
+	p->known = true;
+	p->value = value;
+	applyingChannel = p->channel;
+	CHANNEL_Set(p->channel, value, 0);
+	applyingChannel = previous;
+}
+
+static bool MIoT_QueueWrite(int index, int value) {
+	miotProperty_t *p = &properties[index];
+	int slot;
+	if (!p->writable || value < p->min || value > p->max || ((int64_t)value - p->min) % p->step || queueCount == MIOT_QUEUE)
+		return false;
+	slot = (queueHead + queueCount) % MIOT_QUEUE;
+	writes[slot].property = index;
+	writes[slot].value = value;
+	queueCount++;
+	return true;
+}
+
+// A new poll closes the previous transaction even when firmware silently ignored
+// it. Never retry writes: an error can still have side effects. Always read back.
+static void MIoT_Poll(void) {
+	char reply[96];
+	int i, index, value;
+	miotProperty_t *p;
+	if (pending != MIOT_IDLE) {
+		if (pending == MIOT_WRITE)
+			properties[pendingProperty].read = true;
+		pending = MIOT_IDLE;
+	}
+	for (i = 0; i < propertyCount; i++) {
+		if (properties[i].read) {
+			properties[i].read = false;
+			pending = MIOT_READ;
+			pendingProperty = i;
+			pendingSince = g_timeMs;
+			snprintf(reply, sizeof(reply), "down get_properties %i %i", properties[i].siid, properties[i].piid);
+			MIoT_Send(reply);
+			return;
+		}
+	}
+	if (queueCount) {
+		index = writes[queueHead].property;
+		value = writes[queueHead].value;
+		queueHead = (queueHead + 1) % MIOT_QUEUE;
+		queueCount--;
+		p = &properties[index];
+		pending = MIOT_WRITE;
+		pendingProperty = index;
+		pendingSince = g_timeMs;
+		if (p->boolean)
+			snprintf(reply, sizeof(reply), "down set_properties %i %i %s", p->siid, p->piid, value ? "true" : "false");
+		else
+			snprintf(reply, sizeof(reply), "down set_properties %i %i %i", p->siid, p->piid, value);
+		MIoT_Send(reply);
+		return;
+	}
+	MIoT_Send("down none");
+}
+
+static bool MIoT_Properties(char **tokens, int count, bool result) {
+	int i, siid, piid, code, index, value;
+	int indices[MIOT_PROPERTIES], values[MIOT_PROPERTIES], found = 0;
+	int stride = 3;
+	if (result) {
+		// We issue one property per request. Failed reads omit the value token.
+		if (pending == MIOT_IDLE || count < 4 || !MIoT_Int(tokens[3], &code))
+			return false;
+		stride = pending == MIOT_READ && code == 0 ? 4 : 3;
+		if (count != 1 + stride)
+			return false;
+	}
+	if (count < 1 + stride || (count - 1) % stride)
+		return false;
+	// Validate the whole frame before publishing any of it.
+	for (i = 1; i < count; i += stride) {
+		if (!MIoT_Int(tokens[i], &siid) || !MIoT_Int(tokens[i + 1], &piid) || siid <= 0 || piid <= 0)
+			return false;
+		index = MIoT_Find(siid, piid);
+		if (result) {
+			if (index != pendingProperty || !MIoT_Int(tokens[i + 2], &code))
+				return false;
+			if (code) {
+				addLogAdv(LOG_WARN, LOG_FEATURE_DRV, "MIoT property %i.%i error %i", siid, piid, code);
+				continue;
+			}
+			if (pending == MIOT_WRITE)
+				continue; // write success is not state evidence
+		}
+		if (index < 0)
+			continue; // unconfigured notifications are acknowledged
+		if (!MIoT_Value(index, tokens[i + stride - 1], &value) || found == MIOT_PROPERTIES)
+			return false;
+		indices[found] = index;
+		values[found++] = value;
+	}
+	for (i = 0; i < found; i++)
+		MIoT_Apply(indices[i], values[i]);
+	return true;
+}
+
+static void MIoT_Process(void) {
+	char *tokens[MIOT_TOKENS];
+	char reply[64];
+	int count = MIoT_Tokenize(line, tokens, MIOT_TOKENS);
+	if (count <= 0) {
+		MIoT_Send("error");
+		return;
+	}
+	if (!strcmp(tokens[0], "get_down") && count == 1)
+		MIoT_Poll();
+	else if (!strcmp(tokens[0], "model") && count == 2) {
+		MIoT_ResetSession();
+		addLogAdv(LOG_INFO, LOG_FEATURE_DRV, "MIoT model %s", tokens[1]);
+		MIoT_Send("ok");
+	} else if (!strcmp(tokens[0], "properties_changed")) {
+		MIoT_Send(MIoT_Properties(tokens, count, false) ? "ok" : "error");
+	} else if (!strcmp(tokens[0], "result")) {
+		bool valid = MIoT_Properties(tokens, count, true);
+		if (pending == MIOT_WRITE)
+			properties[pendingProperty].read = true;
+		pending = MIOT_IDLE;
+		MIoT_Send(valid ? "ok" : "error");
+	} else if (!strcmp(tokens[0], "net") && count == 1) {
+		MIoT_Send(Main_IsConnectedToWiFi() ? "local" : "offline");
+	} else if (!strcmp(tokens[0], "mac") && count == 1) {
+		char mac[32];
+		MIoT_Send(HAL_GetMACStr(mac));
+	} else if (!strcmp(tokens[0], "time")) {
+		// A zero reply explicitly means the time source is not ready.
+#if ENABLE_NTP
+		if (NTP_IsTimeSynced() && count == 2 && !strcmp(tokens[1], "posix")) {
+			snprintf(reply, sizeof(reply), "%u", NTP_GetCurrentTimeWithoutOffset());
+			MIoT_Send(reply);
+		} else
+#endif
+			MIoT_Send("0");
+	} else if ((!strcmp(tokens[0], "mcu_version") && count == 2) || (!strcmp(tokens[0], "ble_config") && count >= 2) || (!strcmp(tokens[0], "set_mcu_auto_ota") && count == 2) || !strcmp(tokens[0], "event_occured") || !strcmp(tokens[0], "error")) {
+		MIoT_Send("ok");
+	} else {
+		// Do not honor remote factory-reset or OTA requests. No cloud credentials,
+		// factory reset, or update mechanism is exposed by this transport.
+		MIoT_Send("error");
+	}
+}
+
+void MIoT_RunFrame(void) {
+	int c;
+	if (!running || uartGeneration != get_g_uart_init_counter())
+		return;
+	if (lineLength && (unsigned int)(g_timeMs - lastByte) > MIOT_TIMEOUT) {
+		lineLength = 0;
+		dropping = true;
+	}
+	while (UART_GetDataSize()) {
+		c = UART_GetByte(0);
+		UART_ConsumeBytes(1);
+		lastByte = g_timeMs;
+		if (c == '\r') {
+			line[lineLength] = 0;
+			if (dropping)
+				MIoT_Send("error");
+			else
+				MIoT_Process();
+			lineLength = 0;
+			dropping = false;
+		} else if (c == '\n' && !lineLength && !dropping) {
+			// tolerate CRLF without treating LF as another command
+		} else if (c < 32 || c > 126 || lineLength == MIOT_LINE) {
+			lineLength = 0;
+			dropping = true;
+		} else if (!dropping)
+			line[lineLength++] = (char)c;
+	}
+}
+
+void MIoT_RunEverySecond(void) {
+	if (!running)
+		return;
+	if (pending != MIOT_IDLE && (unsigned int)(g_timeMs - pendingSince) >= MIOT_TIMEOUT) {
+		properties[pendingProperty].read = true;
+		pending = MIOT_IDLE;
+	}
+	if (++pollSeconds >= 10) {
+		pollSeconds = 0;
+		MIoT_ReadAll();
+	}
+}
+
+void MIoT_OnChannelChanged(int channel, int value) {
+	int i;
+	if (!running || channel == applyingChannel)
+		return;
+	for (i = 0; i < propertyCount; i++) {
+		if (properties[i].channel != channel)
+			continue;
+		if (!MIoT_QueueWrite(i, value)) {
+			if (properties[i].known)
+				MIoT_Apply(i, properties[i].value);
+			addLogAdv(LOG_WARN, LOG_FEATURE_DRV, "MIoT rejected channel %i value %i", channel, value);
+		}
+		return;
+	}
+}
+
+static commandResult_t MIoT_Command(const void *context, const char *cmd, const char *args, int flags) {
+	char buffer[192], *tokens[9];
+	int count, siid, piid, index, value;
+	(void)context;
+	(void)flags;
+	if (!running || strlen(args) >= sizeof(buffer))
+		return CMD_RES_BAD_ARGUMENT;
+	strcpy(buffer, args);
+	count = MIoT_Tokenize(buffer, tokens, 9);
+	if (!stricmp(cmd, "miotPoll")) {
+		if (count)
+			return CMD_RES_BAD_ARGUMENT;
+		MIoT_ReadAll();
+		return CMD_RES_OK;
+	}
+	if (count < 2 || !MIoT_Int(tokens[0], &siid) || !MIoT_Int(tokens[1], &piid) || siid <= 0 || piid <= 0)
+		return CMD_RES_BAD_ARGUMENT;
+	index = MIoT_Find(siid, piid);
+	if (!stricmp(cmd, "miotMap")) {
+		miotProperty_t p = {0};
+		int i, writable;
+		p.step = 1;
+		if ((count != 7 && count != 8) || index >= 0 || propertyCount == MIOT_PROPERTIES || !MIoT_Int(tokens[2], &p.channel) || p.channel < 0 || p.channel >= CHANNEL_MAX || !MIoT_Int(tokens[4], &p.min) || !MIoT_Int(tokens[5], &p.max) || p.min > p.max || !MIoT_Int(tokens[6], &writable) || (writable != 0 && writable != 1) || (count == 8 && (!MIoT_Int(tokens[7], &p.step) || p.step <= 0)))
+			return CMD_RES_BAD_ARGUMENT;
+		if (!strcmp(tokens[3], "bool")) {
+			p.boolean = true;
+			if (p.min != 0 || p.max != 1)
+				return CMD_RES_BAD_ARGUMENT;
+		} else if (strcmp(tokens[3], "int"))
+			return CMD_RES_BAD_ARGUMENT;
+		for (i = 0; i < propertyCount; i++)
+			if (properties[i].channel == p.channel)
+				return CMD_RES_BAD_ARGUMENT;
+		p.siid = siid;
+		p.piid = piid;
+		p.writable = writable;
+		p.read = true;
+		properties[propertyCount++] = p;
+		return CMD_RES_OK;
+	}
+	if (index < 0)
+		return CMD_RES_BAD_ARGUMENT;
+	if (!stricmp(cmd, "miotRead") && count == 2) {
+		properties[index].read = true;
+		return CMD_RES_OK;
+	}
+	if (!stricmp(cmd, "miotSet") && count == 3 && MIoT_Value(index, tokens[2], &value)) {
+		if (((int64_t)value - properties[index].min) % properties[index].step)
+			return CMD_RES_BAD_ARGUMENT;
+		return MIoT_QueueWrite(index, value) ? CMD_RES_OK : CMD_RES_ERROR;
+	}
+	return CMD_RES_BAD_ARGUMENT;
+}
+
+void MIoT_Init(void) {
+	propertyCount = 0;
+	lineLength = 0;
+	dropping = false;
+	applyingChannel = -1;
+	pollSeconds = 0;
+	MIoT_ResetSession();
+	UART_InitReceiveRingBuffer(2048);
+	uartGeneration = UART_InitUART(115200, 0, false);
+	running = true;
+	// clang-format off
+	//cmddetail:{"name":"miotMap","args":"SIID PIID Channel bool|int Min Max Writable [Step]",
+	//cmddetail:"descr":"Map a MIoT property to an OpenBeken channel. Writable is 0 or 1; Step defaults to 1. Mappings are polled and refreshed after writes. See docs/MIoT.md.",
+	//cmddetail:"fn":"MIoT_Command","file":"driver/drv_miot.c","requires":"MIoT","examples":"miotMap 2 5 2 int 1 100 1"}
+	CMD_RegisterCommand("miotMap", MIoT_Command, NULL);
+	//cmddetail:{"name":"miotSet","args":"SIID PIID Value",
+	//cmddetail:"descr":"Queue a validated mapped-property write. Boolean values must be true or false. Writes are followed by readback.",
+	//cmddetail:"fn":"MIoT_Command","file":"driver/drv_miot.c","requires":"MIoT","examples":"miotSet 2 1 true"}
+	CMD_RegisterCommand("miotSet", MIoT_Command, NULL);
+	//cmddetail:{"name":"miotRead","args":"SIID PIID",
+	//cmddetail:"descr":"Schedule a mapped-property read on the next MCU poll.",
+	//cmddetail:"fn":"MIoT_Command","file":"driver/drv_miot.c","requires":"MIoT","examples":"miotRead 2 5"}
+	CMD_RegisterCommand("miotRead", MIoT_Command, NULL);
+	//cmddetail:{"name":"miotPoll","args":"",
+	//cmddetail:"descr":"Schedule fresh reads of all MIoT mappings.",
+	//cmddetail:"fn":"MIoT_Command","file":"driver/drv_miot.c","requires":"MIoT","examples":"miotPoll"}
+	CMD_RegisterCommand("miotPoll", MIoT_Command, NULL);
+	// clang-format on
+}
+
+void MIoT_Stop(void) {
+	running = false;
+	MIoT_ResetSession();
+	propertyCount = 0;
+	lineLength = 0;
+}
+
+#endif
