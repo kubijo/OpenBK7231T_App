@@ -128,6 +128,96 @@ static void MIoT_TestSustainedPolling(void) {
 	SELFTEST_ASSERT_CHANNEL(1, 37);
 }
 
+static void MIoT_TestRetainedConfig(const mainConfig_t *before) {
+	mainConfig_t after = g_cfg;
+	// Only the credential fields and save bookkeeping may differ.
+	memcpy(after.wifi_ssid, before->wifi_ssid, sizeof(after.wifi_ssid));
+	memcpy(after.wifi_pass, before->wifi_pass, sizeof(after.wifi_pass));
+#if ALLOW_SSID2
+	memcpy(after.wifi_ssid2, before->wifi_ssid2, sizeof(after.wifi_ssid2));
+	memcpy(after.wifi_pass2, before->wifi_pass2, sizeof(after.wifi_pass2));
+#endif
+	after.crc = before->crc;
+	after.changeCounter = before->changeCounter;
+	SELFTEST_ASSERT(!memcmp(&after, before, sizeof(after)));
+}
+
+static void MIoT_TestNetworkReset(void) {
+	mainConfig_t before;
+	const char *startup = "startDriver MIoT\nmiotMap 2 5 2 int 1 100 1\nmiotAllowNetworkReset 1\n";
+	MIoT_TestSetup();
+	CMD_ExecuteCommand("lfs_format", 0);
+	Test_FakeHTTPClientPacket_POST("api/lfs/autoexec.bat", startup);
+	CFG_SetShortStartupCommand("echo retained-startup");
+	CFG_SetWiFiSSID("miot-test-primary");
+	CFG_SetWiFiPass("primary-test-password");
+	CFG_SetWiFiSSID2("miot-test-alternate");
+	CFG_SetWiFiPass2("alternate-test-password");
+	CFG_SetMQTTHost("mqtt.example.invalid");
+	CFG_Save_IfThereArePendingChanges();
+	before = g_cfg;
+	MIoT_TestReceive("restore\r");
+	MIoT_TestExpect("error\r");
+	SELFTEST_ASSERT(!memcmp(&g_cfg, &before, sizeof(before)));
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotAllowNetworkReset", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotAllowNetworkReset -1", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotAllowNetworkReset 2", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotAllowNetworkReset true", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotAllowNetworkReset 1 extra", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("MIOTALLOWNETWORKRESET 1", 0) == CMD_RES_OK);
+	MIoT_TestReceive("restore extra\rRESTORE\rrestored\r");
+	MIoT_TestExpect("error\rerror\rerror\r");
+	SELFTEST_ASSERT(!memcmp(&g_cfg, &before, sizeof(before)));
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotAllowNetworkReset 0", 0) == CMD_RES_OK);
+	MIoT_TestReceive("restore\r");
+	MIoT_TestExpect("error\r");
+	SELFTEST_ASSERT(!memcmp(&g_cfg, &before, sizeof(before)));
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotAllowNetworkReset 1", 0) == CMD_RES_OK);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotSet 2 5 37", 0) == CMD_RES_OK);
+	MIoT_TestReceive("restore\r");
+	MIoT_TestExpect("ok\r");
+	SELFTEST_ASSERT_STRING(CFG_GetWiFiSSID(), "");
+	SELFTEST_ASSERT_STRING(CFG_GetWiFiPass(), "");
+	SELFTEST_ASSERT_STRING(CFG_GetWiFiSSID2(), "");
+	SELFTEST_ASSERT_STRING(CFG_GetWiFiPass2(), "");
+	MIoT_TestRetainedConfig(&before);
+	// No queued or new control write may replay while a network reset is pending.
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotSet 2 5 37", 0) == CMD_RES_ERROR);
+	MIoT_TestReceive("model xiaomi.fan.p45\rget_down\r");
+	MIoT_TestExpect("ok\rdown get_properties 2 1\r");
+	// Duplicate requests acknowledge without clearing edits or postponing reboot.
+	CFG_SetWiFiSSID("edited-after-request");
+	MIoT_TestReceive("restore\rrestore\r");
+	MIoT_TestExpect("ok\rok\r");
+	SELFTEST_ASSERT_STRING(CFG_GetWiFiSSID(), "edited-after-request");
+	CFG_SetWiFiSSID("");
+	Main_OnEverySecond();
+	MIoT_TestReceive("restore\r");
+	MIoT_TestExpect("ok\r");
+	Main_OnEverySecond();
+	MIoT_TestReceive("restore\r");
+	MIoT_TestExpect("ok\r");
+	Main_OnEverySecond();
+	// Reload through the configuration CRC/storage path, not from driver state.
+	memset(&g_cfg, 0, sizeof(g_cfg));
+	CFG_InitAndLoad();
+	SELFTEST_ASSERT_STRING(CFG_GetWiFiSSID(), "");
+	SELFTEST_ASSERT_STRING(CFG_GetWiFiPass(), "");
+	SELFTEST_ASSERT_STRING(CFG_GetWiFiSSID2(), "");
+	SELFTEST_ASSERT_STRING(CFG_GetWiFiPass2(), "");
+	MIoT_TestRetainedConfig(&before);
+	Test_FakeHTTPClientPacket_GET("api/lfs/autoexec.bat");
+	SELFTEST_ASSERT_HTML_REPLY(startup);
+	CMD_ExecuteCommand("lfs_remove autoexec.bat", 0);
+	CFG_SetShortStartupCommand("");
+	CFG_Save_IfThereArePendingChanges();
+	CMD_ExecuteCommand("stopDriver MIoT", 0);
+	CMD_ExecuteCommand("startDriver MIoT", 0);
+	MIoT_TestReceive("restore\r");
+	MIoT_TestExpect("error\r");
+	CMD_ExecuteCommand("stopDriver MIoT", 0);
+}
+
 void Test_MIoT(void) {
 	int i;
 	MIoT_TestCallbacks();
@@ -239,6 +329,7 @@ void Test_MIoT(void) {
 	CMD_ExecuteCommand("stopDriver MIoT", 0);
 	SELFTEST_ASSERT(CMD_ExecuteCommand("miotSet 2 5 37", 0) == CMD_RES_BAD_ARGUMENT);
 	SELFTEST_ASSERT_HAS_UART_EMPTY();
+	MIoT_TestNetworkReset();
 }
 #endif
 #endif

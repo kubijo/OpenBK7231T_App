@@ -70,11 +70,34 @@ through the next CR. An MCU `model` announcement clears queued pre-reset command
 and schedules fresh reads. Periodic reads also refresh mapped state. Stopping the
 driver or handing its UART to another driver prevents further UART processing.
 
+## Network recovery
+
+MCU-requested Wi-Fi reset is disabled whenever the driver starts. Add
+`miotAllowNetworkReset 1` after `startDriver MIoT` in the startup script to opt in.
+Use `miotAllowNetworkReset 0` to reject future requests. An accepted request already
+scheduled for reboot remains pending.
+
+When enabled, the MCU's `restore` command without arguments is acknowledged and
+clears both saved Wi-Fi networks through the normal configuration setters. The
+existing deferred save and reboot path returns the module to AP setup. MQTT,
+channel settings, property mappings, and LittleFS startup scripts are preserved.
+The MCU may reset its own fan settings independently of the module.
+
+Queued control writes are discarded, and new writes are rejected until reboot.
+Repeated `restore` requests are acknowledged without clearing settings again or
+postponing reboot. MCU identification and fresh reads can still resynchronize
+channel state. Full factory erase and firmware updates remain outside this
+handler. Setup-specific network-state replies and physical Wi-Fi indicator
+behavior require separate verification.
+
 ## Verification
 
 The host self-tests exercise framing, strict input validation, notification
 atomicity, readback, errors, silent ignores, timeout recovery, backpressure, restart,
-and UART ownership. A separate Renode bridge runs the compiled host driver against
-the unmodified p45 MCU image for the four core controls and recovery checks.
+UART ownership, network-reset policy, and saved configuration reload. A separate
+Renode bridge runs the compiled host driver against the unmodified p45 MCU image
+for the four core controls and button-triggered network recovery. Its parent-owned
+harness observes reboot/AP callbacks and reloads simulator flash in a fresh process;
+radio behavior and BL602 EasyFlash persistence need separate verification.
 The BL602 build checks target compilation; physical pins, electrical timing, motor
 behavior, and running the driver on BL602 silicon require separate verification.

@@ -3,6 +3,7 @@
 #include "../cmnds/cmd_public.h"
 #include "../hal/hal_wifi.h"
 #include "../logging/logging.h"
+#include "../new_cfg.h"
 #include "../new_common.h"
 #include "../new_pins.h"
 #include "../quicktick.h"
@@ -47,6 +48,7 @@ static int uartGeneration;
 static int uartPort;
 static unsigned int sessionGeneration;
 static bool running, dropping;
+static bool allowNetworkReset, networkResetRequested;
 static int applyingChannel = -1;
 static int applyingValue;
 static char line[MIOT_LINE + 1];
@@ -160,7 +162,7 @@ static void MIoT_Apply(int index, int value) {
 static bool MIoT_QueueWrite(int index, int value) {
 	miotProperty_t *p = &properties[index];
 	int slot;
-	if (!p->writable || value < p->min || value > p->max || ((int64_t)value - p->min) % p->step || queueCount == MIOT_QUEUE)
+	if (networkResetRequested || !p->writable || value < p->min || value > p->max || ((int64_t)value - p->min) % p->step || queueCount == MIOT_QUEUE)
 		return false;
 	slot = (queueHead + queueCount) % MIOT_QUEUE;
 	writes[slot].property = index;
@@ -301,6 +303,20 @@ static void MIoT_Process(void) {
 		MIoT_Send(valid ? "ok" : "error");
 	} else if (!strcmp(tokens[0], "net") && count == 1) {
 		MIoT_Send(Main_IsConnectedToWiFi() ? "local" : "offline");
+	} else if (!strcmp(tokens[0], "restore") && count == 1 && allowNetworkReset) {
+		MIoT_Send("ok");
+		if (!MIoT_IsCurrent(generation))
+			return;
+		if (!networkResetRequested) {
+			networkResetRequested = true;
+			MIoT_ResetSession();
+			CFG_SetWiFiSSID("");
+			CFG_SetWiFiPass("");
+			CFG_SetWiFiSSID2("");
+			CFG_SetWiFiPass2("");
+			CFG_Save_SetupTimer();
+			RESET_ScheduleModuleReset(3);
+		}
 	} else if (!strcmp(tokens[0], "mac") && count == 1) {
 		char mac[32];
 		MIoT_Send(HAL_GetMACStr(mac));
@@ -316,8 +332,8 @@ static void MIoT_Process(void) {
 	} else if ((!strcmp(tokens[0], "mcu_version") && count == 2) || (!strcmp(tokens[0], "ble_config") && count >= 2) || (!strcmp(tokens[0], "set_mcu_auto_ota") && count == 2) || !strcmp(tokens[0], "event_occured") || !strcmp(tokens[0], "error")) {
 		MIoT_Send("ok");
 	} else {
-		// Do not honor remote factory-reset or OTA requests. No cloud credentials,
-		// factory reset, or update mechanism is exposed by this transport.
+		// Factory erase and OTA are not exposed by this transport. Network reset
+		// requires an explicit opt-in and preserves all other configuration.
 		MIoT_Send("error");
 	}
 }
@@ -409,6 +425,12 @@ static commandResult_t MIoT_Command(const void *context, const char *cmd, const 
 		return CMD_RES_BAD_ARGUMENT;
 	strcpy(buffer, args);
 	count = MIoT_Tokenize(buffer, tokens, 9);
+	if (!stricmp(cmd, "miotAllowNetworkReset")) {
+		if (count != 1 || !MIoT_Int(tokens[0], &value) || (value != 0 && value != 1))
+			return CMD_RES_BAD_ARGUMENT;
+		allowNetworkReset = value != 0;
+		return CMD_RES_OK;
+	}
 	if (!stricmp(cmd, "miotPoll")) {
 		if (count)
 			return CMD_RES_BAD_ARGUMENT;
@@ -459,6 +481,7 @@ void MIoT_Init(void) {
 	propertyCount = 0;
 	lineLength = 0;
 	dropping = false;
+	allowNetworkReset = networkResetRequested = false;
 	applyingChannel = -1;
 	pollSeconds = 0;
 	MIoT_ResetSession();
@@ -483,6 +506,10 @@ void MIoT_Init(void) {
 	//cmddetail:"descr":"Schedule fresh reads of all MIoT mappings.",
 	//cmddetail:"fn":"MIoT_Command","file":"driver/drv_miot.c","requires":"MIoT","examples":"miotPoll"}
 	CMD_RegisterCommand("miotPoll", MIoT_Command, NULL);
+	//cmddetail:{"name":"miotAllowNetworkReset","args":"0|1",
+	//cmddetail:"descr":"Allow MCU restore requests to clear both Wi-Fi networks and reboot into setup. Disabled on driver start; other configuration is preserved.",
+	//cmddetail:"fn":"MIoT_Command","file":"driver/drv_miot.c","requires":"MIoT","examples":"miotAllowNetworkReset 1"}
+	CMD_RegisterCommand("miotAllowNetworkReset", MIoT_Command, NULL);
 	// clang-format on
 }
 
