@@ -48,8 +48,8 @@ POSIX time requests use synchronized NTP when available; other time requests
 return zero. Firmware update, factory reset, string/float properties, and actions
 are not implemented. Events are acknowledged without a channel mapping.
 
-Commands wait for the MCU's `get_down` poll. Reads take priority over queued
-writes; each write is followed by an independent read, including after an error or
+Commands wait for the MCU's `get_down` poll. Background reads rotate and share
+polls with queued writes; each write is followed by an independent read, including after an error or
 a missing result. Success replies alone never establish channel state. MCU change
 notifications and successful reads update channels without echoing another write.
 OpenBeken's ordinary channel commands initially change the local channel value;

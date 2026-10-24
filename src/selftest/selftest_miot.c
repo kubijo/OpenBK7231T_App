@@ -84,9 +84,54 @@ static void MIoT_TestCallbacks(void) {
 	MIoT_TestExpect("down get_properties 2 5\r");
 }
 
+static void MIoT_TestSustainedPolling(void) {
+	int i, piid, value, writes = 0;
+	unsigned int reads = 0;
+	char text[128];
+	size_t length;
+	SIM_ClearOBK(0);
+	SIM_UART_InitReceiveRingBuffer(8192);
+	CMD_ExecuteCommand("startDriver MIoT", 0);
+	for (i = 1; i <= 16; i++)
+		SELFTEST_ASSERT(CMD_ExecuteCommand(va("miotMap 2 %i %i int 0 100 1", i, i), 0) == CMD_RES_OK);
+	MIoT_TestReceive("model test\r");
+	MIoT_TestExpect("ok\r");
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotSet 2 1 37", 0) == CMD_RES_OK);
+	for (i = 0; i < 40; i++) {
+		g_timeMs += 1000;
+		MIoT_RunEverySecond();
+		MIoT_TestReceive("get_down\r");
+		length = 0;
+		while (SIM_UART_GetDataSize() && length < sizeof(text) - 1) {
+			text[length++] = SIM_UART_GetByte(0);
+			SIM_UART_ConsumeBytes(1);
+		}
+		text[length] = 0;
+		if (sscanf(text, "down get_properties 2 %i", &piid) == 1) {
+			SELFTEST_ASSERT(piid >= 1 && piid <= 16);
+			if (piid < 1 || piid > 16)
+				return;
+			reads |= 1U << (piid - 1);
+			MIoT_TestReceive(va("result 2 %i 0 %i\r", piid, piid == 1 && writes ? 37 : 0));
+			MIoT_TestExpect("ok\r");
+		} else if (sscanf(text, "down set_properties 2 %i %i", &piid, &value) == 2) {
+			SELFTEST_ASSERT(piid == 1 && value == 37);
+			writes++;
+			MIoT_TestReceive("result 2 1 0\r");
+			MIoT_TestExpect("ok\r");
+		} else {
+			SELFTEST_ASSERT_STRING(text, "down none\r");
+		}
+	}
+	SELFTEST_ASSERT(reads == 0xFFFFU);
+	SELFTEST_ASSERT(writes == 1);
+	SELFTEST_ASSERT_CHANNEL(1, 37);
+}
+
 void Test_MIoT(void) {
 	int i;
 	MIoT_TestCallbacks();
+	MIoT_TestSustainedPolling();
 	MIoT_TestSetup();
 	// Mapping and outgoing values have strict syntax, types and bounds.
 	SELFTEST_ASSERT(CMD_ExecuteCommand("miotMap 2 1 4 bool 0 1 1", 0) == CMD_RES_BAD_ARGUMENT);

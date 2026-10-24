@@ -39,6 +39,9 @@ static miotWrite_t writes[MIOT_QUEUE];
 static int queueHead, queueCount;
 static miotPending_t pending;
 static int pendingProperty;
+static int readbackProperty = -1;
+static int readCursor;
+static bool preferWrite;
 static unsigned int pendingSince, lastByte;
 static int uartGeneration;
 static int uartPort;
@@ -113,6 +116,9 @@ static void MIoT_ResetSession(void) {
 	int i;
 	queueHead = queueCount = 0;
 	pending = MIOT_IDLE;
+	readbackProperty = -1;
+	readCursor = 0;
+	preferWrite = false;
 	for (i = 0; i < propertyCount; i++) {
 		properties[i].known = false;
 		properties[i].reconcile = false;
@@ -163,26 +169,44 @@ static bool MIoT_QueueWrite(int index, int value) {
 	return true;
 }
 
-// A new poll closes the previous transaction even when firmware silently ignored
-// it. Never retry writes: an error can still have side effects. Always read back.
+static void MIoT_FinishRequest(void) {
+	if (pending == MIOT_WRITE)
+		readbackProperty = pendingProperty;
+	pending = MIOT_IDLE;
+}
+
+static void MIoT_RequestRead(int index) {
+	char reply[96];
+	properties[index].read = false;
+	pending = MIOT_READ;
+	pendingProperty = index;
+	pendingSince = g_timeMs;
+	snprintf(reply, sizeof(reply), "down get_properties %i %i", properties[index].siid, properties[index].piid);
+	MIoT_Send(reply);
+}
+
+// Finish silently ignored requests without replaying writes. Readback stays
+// urgent; background reads rotate and share polls with queued writes.
 static void MIoT_Poll(void) {
 	char reply[96];
-	int i, index, value;
+	int i, offset, index, value;
 	miotProperty_t *p;
-	if (pending != MIOT_IDLE) {
-		if (pending == MIOT_WRITE)
-			properties[pendingProperty].read = true;
-		pending = MIOT_IDLE;
+	MIoT_FinishRequest();
+	if (readbackProperty >= 0) {
+		index = readbackProperty;
+		readbackProperty = -1;
+		MIoT_RequestRead(index);
+		return;
 	}
-	for (i = 0; i < propertyCount; i++) {
-		if (properties[i].read) {
-			properties[i].read = false;
-			pending = MIOT_READ;
-			pendingProperty = i;
-			pendingSince = g_timeMs;
-			snprintf(reply, sizeof(reply), "down get_properties %i %i", properties[i].siid, properties[i].piid);
-			MIoT_Send(reply);
-			return;
+	if (!queueCount || !preferWrite) {
+		for (offset = 0; offset < propertyCount; offset++) {
+			i = (readCursor + offset) % propertyCount;
+			if (properties[i].read) {
+				readCursor = (i + 1) % propertyCount;
+				preferWrite = true;
+				MIoT_RequestRead(i);
+				return;
+			}
 		}
 	}
 	if (queueCount) {
@@ -190,6 +214,7 @@ static void MIoT_Poll(void) {
 		value = writes[queueHead].value;
 		queueHead = (queueHead + 1) % MIOT_QUEUE;
 		queueCount--;
+		preferWrite = false;
 		p = &properties[index];
 		pending = MIOT_WRITE;
 		pendingProperty = index;
@@ -272,9 +297,7 @@ static void MIoT_Process(void) {
 		bool valid = MIoT_Properties(tokens, count, true);
 		if (!MIoT_IsCurrent(generation))
 			return;
-		if (pending == MIOT_WRITE)
-			properties[pendingProperty].read = true;
-		pending = MIOT_IDLE;
+		MIoT_FinishRequest();
 		MIoT_Send(valid ? "ok" : "error");
 	} else if (!strcmp(tokens[0], "net") && count == 1) {
 		MIoT_Send(Main_IsConnectedToWiFi() ? "local" : "offline");
@@ -343,8 +366,9 @@ void MIoT_RunEverySecond(void) {
 	if (!MIoT_IsCurrent(sessionGeneration))
 		return;
 	if (pending != MIOT_IDLE && (unsigned int)(g_timeMs - pendingSince) >= MIOT_TIMEOUT) {
-		properties[pendingProperty].read = true;
-		pending = MIOT_IDLE;
+		if (pending == MIOT_READ)
+			properties[pendingProperty].read = true;
+		MIoT_FinishRequest();
 	}
 	if (++pollSeconds >= 10) {
 		pollSeconds = 0;
