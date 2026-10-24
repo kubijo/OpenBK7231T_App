@@ -61,9 +61,9 @@ static int SaveFlashVars(void* src, int dataLen)
 // call at startup
 void HAL_FlashVars_IncreaseBootCount()
 {
-	memset(&flash_vars, 0, sizeof(flash_vars));
 	if(g_loaded == 0)
 	{
+		memset(&flash_vars, 0, sizeof(flash_vars));
 		ReadFlashVars(&flash_vars, sizeof(flash_vars));
 	}
 	flash_vars.boot_count++;
