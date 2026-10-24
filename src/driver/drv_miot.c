@@ -8,9 +8,13 @@
 #include "../new_pins.h"
 #include "../quicktick.h"
 #include "drv_ntp.h"
+#include "drv_public.h"
 #include "drv_uart.h"
 #include <errno.h>
 #include <limits.h>
+#if ENABLE_HA_DISCOVERY && ENABLE_MQTT
+#include "../httpserver/hass.h"
+#endif
 
 #if ENABLE_DRIVER_MIOT
 
@@ -54,6 +58,86 @@ static int applyingValue;
 static char line[MIOT_LINE + 1];
 static size_t lineLength;
 static unsigned int pollSeconds;
+static bool MIoT_Int(const char *text, int *value);
+
+#if ENABLE_HA_DISCOVERY && ENABLE_MQTT
+static int fanProperties[4];
+static bool fanEnabled, fanDirty, fanMqttReady;
+static char fanDiscoveryTopic[64] = "homeassistant";
+
+static void MIoT_QueueFanDiscovery(const char *topic, const char *channel, const char *value) {
+	if (MQTT_CancelQueuedPublish(topic, channel))
+		MQTT_QueuePublish(topic, channel, value, OBK_PUBLISH_FLAG_RETAIN);
+}
+
+static void MIoT_ClearFan(void) {
+	int i;
+	for (i = 0; i < 2; i++) {
+		HassDeviceInfo *info = hass_init_device_info(i ? HASS_SELECT : HASS_FAN, 0, NULL, NULL, 0, i ? "fan" : NULL);
+		if (!info)
+			continue;
+		if (i)
+			snprintf(info->channel, sizeof(info->channel), "select/%s/config", info->unique_id);
+		MIoT_QueueFanDiscovery(fanDiscoveryTopic, info->channel, "");
+		hass_free_device_info(info);
+	}
+	MIoT_QueueFanDiscovery(CFG_GetMQTTClientId(), "miot/fan/get", "");
+}
+
+static void MIoT_PublishFanState(void) {
+	char state[128];
+	int i;
+	if (!fanEnabled || !fanDirty || !MQTT_IsReady())
+		return;
+	for (i = 0; i < 4; i++)
+		if (!properties[fanProperties[i]].known)
+			return;
+	snprintf(state, sizeof(state), "{\"power\":%s,\"speed\":%i,\"oscillation\":%s,\"angle\":%i}",
+			 properties[fanProperties[0]].value ? "true" : "false", properties[fanProperties[1]].value,
+			 properties[fanProperties[2]].value ? "true" : "false", properties[fanProperties[3]].value);
+	// Publish the current snapshot directly: reusable queue slots can reorder states.
+	if (MQTT_Publish(CFG_GetMQTTClientId(), "miot/fan/get", state, OBK_PUBLISH_FLAG_RETAIN) == OBK_PUBLISH_OK)
+		fanDirty = false;
+}
+
+static commandResult_t MIoT_FanCommand(char **tokens, int count) {
+	int indices[4], i, j, channel;
+	miotProperty_t *speed, *angle;
+	int64_t options;
+	if (count == 1 && !strcmp(tokens[0], "off")) {
+		if (fanEnabled)
+			MIoT_ClearFan();
+		fanEnabled = false;
+		return CMD_RES_OK;
+	}
+	if (count != 4)
+		return CMD_RES_BAD_ARGUMENT;
+	for (i = 0; i < 4; i++) {
+		indices[i] = -1;
+		if (!MIoT_Int(tokens[i], &channel))
+			return CMD_RES_BAD_ARGUMENT;
+		for (j = 0; j < propertyCount; j++)
+			if (properties[j].channel == channel && properties[j].writable)
+				indices[i] = j;
+		if (indices[i] < 0)
+			return CMD_RES_BAD_ARGUMENT;
+		for (j = 0; j < i; j++)
+			if (indices[i] == indices[j])
+				return CMD_RES_BAD_ARGUMENT;
+	}
+	speed = &properties[indices[1]];
+	angle = &properties[indices[3]];
+	options = ((int64_t)angle->max - angle->min) / angle->step + 1;
+	if (!properties[indices[0]].boolean || properties[indices[0]].step != 1 || !properties[indices[2]].boolean || properties[indices[2]].step != 1 || speed->boolean || speed->min < 1 || speed->max <= speed->min || speed->step != 1 || angle->boolean || options < 2 || options > 16)
+		return CMD_RES_BAD_ARGUMENT;
+	if (!MQTT_CancelQueuedPublish(CFG_GetMQTTClientId(), "miot/fan/get"))
+		return CMD_RES_ERROR;
+	memcpy(fanProperties, indices, sizeof(indices));
+	fanEnabled = fanDirty = true;
+	CMD_ExecuteCommand("scheduleHADiscovery 1", 0);
+	return CMD_RES_OK;
+}
+#endif
 
 static bool MIoT_IsCurrent(unsigned int generation) {
 	return running && sessionGeneration == generation && uartPort == UART_GetSelectedPortIndex() && uartGeneration == get_g_uart_init_counter();
@@ -150,6 +234,9 @@ static void MIoT_Apply(int index, int value) {
 	p->known = true;
 	p->value = value;
 	p->reconcile = false;
+#if ENABLE_HA_DISCOVERY && ENABLE_MQTT
+	fanDirty = true;
+#endif
 	applyingChannel = p->channel;
 	applyingValue = value;
 	CHANNEL_Set(p->channel, value, 0);
@@ -378,6 +465,73 @@ void MIoT_RunFrame(void) {
 	}
 }
 
+void MIoT_OnHassDiscovery(const char *topic) {
+#if ENABLE_HA_DISCOVERY && ENABLE_MQTT
+	HassDeviceInfo *info;
+	miotProperty_t *power, *speed, *oscillation, *angle;
+	char command[CGF_MQTT_CLIENT_ID_SIZE + 24], text[256];
+	int i, optionCount;
+	cJSON *options;
+	if (!fanEnabled || !MIoT_IsCurrent(sessionGeneration) || strlen(topic) >= sizeof(fanDiscoveryTopic))
+		return;
+	strcpy(fanDiscoveryTopic, topic);
+	power = &properties[fanProperties[0]];
+	speed = &properties[fanProperties[1]];
+	oscillation = &properties[fanProperties[2]];
+	angle = &properties[fanProperties[3]];
+	snprintf(command, sizeof(command), "cmnd/%s/miotSet", CFG_GetMQTTClientId());
+	info = hass_init_device_info(HASS_FAN, 0, "true", "false", 0, NULL);
+	if (!info)
+		return;
+	cJSON_ReplaceItemInObject(info->root, "name", cJSON_CreateString("Fan"));
+	cJSON_AddStringToObject(info->root, "cmd_t", command);
+	snprintf(text, sizeof(text), "%i %i {{value}}", power->siid, power->piid);
+	cJSON_AddStringToObject(info->root, "cmd_tpl", text);
+	cJSON_AddStringToObject(info->root, "stat_t", "~/miot/fan/get");
+	cJSON_AddStringToObject(info->root, "stat_val_tpl", "{{ 'true' if value_json.power else 'false' }}");
+	cJSON_AddStringToObject(info->root, "pct_cmd_t", command);
+	snprintf(text, sizeof(text), "{%% if value|int < %i %%}%i %i false{%% else %%}%i %i {{value}}{%% endif %%}", speed->min, power->siid, power->piid, speed->siid, speed->piid);
+	cJSON_AddStringToObject(info->root, "pct_cmd_tpl", text);
+	cJSON_AddStringToObject(info->root, "pct_stat_t", "~/miot/fan/get");
+	snprintf(text, sizeof(text), "{{ value_json.speed if value_json.power else %i }}", speed->min - 1);
+	cJSON_AddStringToObject(info->root, "pct_val_tpl", text);
+	cJSON_AddNumberToObject(info->root, "spd_rng_min", speed->min);
+	cJSON_AddNumberToObject(info->root, "spd_rng_max", speed->max);
+	cJSON_AddStringToObject(info->root, "osc_cmd_t", command);
+	snprintf(text, sizeof(text), "%i %i {{value}}", oscillation->siid, oscillation->piid);
+	cJSON_AddStringToObject(info->root, "osc_cmd_tpl", text);
+	cJSON_AddStringToObject(info->root, "osc_stat_t", "~/miot/fan/get");
+	cJSON_AddStringToObject(info->root, "osc_val_tpl", "{{ 'true' if value_json.oscillation else 'false' }}");
+	cJSON_AddStringToObject(info->root, "pl_osc_on", "true");
+	cJSON_AddStringToObject(info->root, "pl_osc_off", "false");
+	cJSON_AddBoolToObject(info->root, "ret", false);
+	MIoT_QueueFanDiscovery(topic, info->channel, hass_build_discovery_json(info));
+	hass_free_device_info(info);
+	info = hass_init_device_info(HASS_SELECT, 0, NULL, NULL, 0, "fan");
+	if (!info)
+		return;
+	snprintf(info->channel, sizeof(info->channel), "select/%s/config", info->unique_id);
+	cJSON_ReplaceItemInObject(info->root, "name", cJSON_CreateString("Swing angle"));
+	cJSON_AddStringToObject(info->root, "cmd_t", command);
+	snprintf(text, sizeof(text), "%i %i {{value}}", angle->siid, angle->piid);
+	cJSON_AddStringToObject(info->root, "cmd_tpl", text);
+	cJSON_AddStringToObject(info->root, "stat_t", "~/miot/fan/get");
+	cJSON_AddStringToObject(info->root, "val_tpl", "{{ value_json.angle }}");
+	cJSON_AddBoolToObject(info->root, "ret", false);
+	options = cJSON_AddArrayToObject(info->root, "ops");
+	optionCount = (int)(((int64_t)angle->max - angle->min) / angle->step + 1);
+	for (i = 0; i < optionCount; i++) {
+		snprintf(text, sizeof(text), "%i", (int)((int64_t)angle->min + (int64_t)i * angle->step));
+		cJSON_AddItemToArray(options, cJSON_CreateString(text));
+	}
+	MIoT_QueueFanDiscovery(topic, info->channel, hass_build_discovery_json(info));
+	hass_free_device_info(info);
+	fanDirty = true;
+#else
+	(void)topic;
+#endif
+}
+
 void MIoT_RunEverySecond(void) {
 	if (!MIoT_IsCurrent(sessionGeneration))
 		return;
@@ -390,6 +544,12 @@ void MIoT_RunEverySecond(void) {
 		pollSeconds = 0;
 		MIoT_ReadAll();
 	}
+#if ENABLE_HA_DISCOVERY && ENABLE_MQTT
+	if (MQTT_IsReady() && !fanMqttReady && fanEnabled)
+		CMD_ExecuteCommand("scheduleHADiscovery 1", 0);
+	fanMqttReady = MQTT_IsReady();
+	MIoT_PublishFanState();
+#endif
 }
 
 void MIoT_OnChannelChanged(int channel, int value) {
@@ -425,6 +585,17 @@ static commandResult_t MIoT_Command(const void *context, const char *cmd, const 
 		return CMD_RES_BAD_ARGUMENT;
 	strcpy(buffer, args);
 	count = MIoT_Tokenize(buffer, tokens, 9);
+#if ENABLE_HA_DISCOVERY && ENABLE_MQTT
+	if (!stricmp(cmd, "miotFan")) {
+		commandResult_t result;
+		// Reject reentrant calls rather than racing discovery, state publication or stop.
+		if (!DRV_Mutex_Take(0))
+			return CMD_RES_ERROR;
+		result = MIoT_IsCurrent(sessionGeneration) ? MIoT_FanCommand(tokens, count) : CMD_RES_ERROR;
+		DRV_Mutex_Free();
+		return result;
+	}
+#endif
 	if (!stricmp(cmd, "miotAllowNetworkReset")) {
 		if (count != 1 || !MIoT_Int(tokens[0], &value) || (value != 0 && value != 1))
 			return CMD_RES_BAD_ARGUMENT;
@@ -484,6 +655,10 @@ void MIoT_Init(void) {
 	allowNetworkReset = networkResetRequested = false;
 	applyingChannel = -1;
 	pollSeconds = 0;
+#if ENABLE_HA_DISCOVERY && ENABLE_MQTT
+	fanEnabled = fanDirty = fanMqttReady = false;
+	strcpy(fanDiscoveryTopic, "homeassistant");
+#endif
 	MIoT_ResetSession();
 	UART_InitReceiveRingBuffer(2048);
 	uartPort = UART_GetSelectedPortIndex();
@@ -510,10 +685,21 @@ void MIoT_Init(void) {
 	//cmddetail:"descr":"Allow MCU restore requests to clear both Wi-Fi networks and reboot into setup. Disabled on driver start; other configuration is preserved.",
 	//cmddetail:"fn":"MIoT_Command","file":"driver/drv_miot.c","requires":"MIoT","examples":"miotAllowNetworkReset 1"}
 	CMD_RegisterCommand("miotAllowNetworkReset", MIoT_Command, NULL);
+#if ENABLE_HA_DISCOVERY && ENABLE_MQTT
+	//cmddetail:{"name":"miotFan","args":"PowerChannel SpeedChannel OscillationChannel AngleChannel|off",
+	//cmddetail:"descr":"Bind existing writable MIoT mappings to an MQTT fan and swing-angle select. Speed requires integer steps; angle permits 2 to 16 options. off removes discovery.",
+	//cmddetail:"fn":"MIoT_Command","file":"driver/drv_miot.c","requires":"MIoT","examples":"miotFan 1 2 3 4"}
+	CMD_RegisterCommand("miotFan", MIoT_Command, NULL);
+#endif
 	// clang-format on
 }
 
 void MIoT_Stop(void) {
+#if ENABLE_HA_DISCOVERY && ENABLE_MQTT
+	if (fanEnabled)
+		MIoT_ClearFan();
+	fanEnabled = false;
+#endif
 	running = false;
 	sessionGeneration++;
 	MIoT_ResetSession();

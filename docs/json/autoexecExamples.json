@@ -1,5 +1,9 @@
 [
 {
+"title": "[Xiaomi Smart Tower Fan 2 (p45) MIoT controls and Home Assistant fan discovery](MIoT.md)",
+"file": "autoexecs/Xiaomi-Smart-Tower-Fan-2-p45.bat"
+},
+{
 "title": "[Configuration for EDM-01AA-EU dimmer with TuyaMCU](https://www.elektroda.com/rtvforum/topic3929151.html)",
 "file": "autoexecs/EDM-01AA-EU.bat"
 },

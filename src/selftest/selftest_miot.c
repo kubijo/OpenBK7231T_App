@@ -218,6 +218,105 @@ static void MIoT_TestNetworkReset(void) {
 	CMD_ExecuteCommand("stopDriver MIoT", 0);
 }
 
+static void MIoT_TestFanDiscovery(void) {
+	const char *snapshot = "{\"power\":false,\"speed\":1,\"oscillation\":false,\"angle\":90}";
+	char name[64], topic[128], uniqueId[75];
+	SIM_ClearOBK(0);
+	SIM_ClearAndPrepareForMQTTTesting("miot-test", "bekens");
+	CFG_SetDeviceName("miot-fan");
+	SIM_UART_InitReceiveRingBuffer(8192);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("startDriver MIoT", 0) == CMD_RES_OK);
+	CMD_ExecuteCommand("miotMap 2 1 1 bool 0 1 1", 0);
+	CMD_ExecuteCommand("miotMap 2 5 2 int 1 100 1", 0);
+	CMD_ExecuteCommand("miotMap 2 6 3 bool 0 1 1", 0);
+	CMD_ExecuteCommand("miotMap 2 7 4 int 30 150 1 30", 0);
+	CMD_ExecuteCommand("miotMap 99 1 5 int 1 100 0", 0);
+	CMD_ExecuteCommand("miotMap 99 2 6 int 0 100 1", 0);
+	CMD_ExecuteCommand("miotMap 99 3 7 int 0 1000 1", 0);
+	CMD_ExecuteCommand("miotMap 99 4 8 int 1 1 1", 0);
+	CMD_ExecuteCommand("miotMap 99 5 9 bool 0 1 1 2", 0);
+	CMD_ExecuteCommand("miotMap 99 6 10 bool 0 1 1 2", 0);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFan", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFan 1 2 3", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFan 1 2 1 4", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFan 1 2 3 8", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFan 1 5 3 4", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFan 1 6 3 4", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFan 1 2 3 7", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFan 2 1 3 4", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFan 1 2 3 4 extra", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFan 1 2 3 4", 0) == CMD_RES_OK);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFan 1 2 2 4", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFan 1 8 3 4", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFan 9 2 3 4", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFan 1 2 10 4", 0) == CMD_RES_BAD_ARGUMENT);
+	SIM_ClearMQTTHistory();
+	MIoT_OnHassDiscovery("homeassistant");
+	Sim_RunSeconds(4, false);
+	SELFTEST_ASSERT_HAS_MQTT_JSON_SENT("homeassistant/fan/miot-fan_fan/config", false);
+	SELFTEST_ASSERT_JSON_VALUE_STRING(NULL, "stat_t", "~/miot/fan/get");
+	SELFTEST_ASSERT_JSON_VALUE_STRING(NULL, "cmd_t", "cmnd/miot-test/miotSet");
+	SELFTEST_ASSERT_JSON_VALUE_STRING(NULL, "avty_t", "~/connected");
+	SELFTEST_ASSERT_HAS_MQTT_JSON_SENT("homeassistant/select/miot-fan_select_fan/config", false);
+	SELFTEST_ASSERT_JSON_VALUE_STRING(NULL, "stat_t", "~/miot/fan/get");
+	SELFTEST_ASSERT(!SIM_CheckMQTTHistoryForString("miot-test/miot/fan/get", snapshot, true));
+	MIoT_TestReceive("properties_changed 2 1 false 2 5 1 2 6 false 2 7 90\r");
+	MIoT_TestExpect("ok\r");
+	Sim_RunSeconds(2, false);
+	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR("miot-test/miot/fan/get", snapshot, true);
+	SIM_ClearMQTTHistory();
+	CMD_ExecuteCommand("setChannel 2 37", 0);
+	CMD_ExecuteCommand("setChannel 3 1", 0);
+	Sim_RunSeconds(2, false);
+	SELFTEST_ASSERT(!SIM_CheckMQTTHistoryForString("miot-test/miot/fan/get", "{\"power\":false,\"speed\":37,\"oscillation\":true,\"angle\":90}", true));
+	MIoT_TestReceive("properties_changed 2 1 false 2 5 1 2 6 false 2 7 90\r");
+	MIoT_TestExpect("ok\r");
+	Sim_RunSeconds(2, false);
+	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR("miot-test/miot/fan/get", snapshot, true);
+	SIM_ClearMQTTHistory();
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFan off", 0) == CMD_RES_OK);
+	Sim_RunSeconds(2, false);
+	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR("homeassistant/fan/miot-fan_fan/config", "", true);
+	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR("homeassistant/select/miot-fan_select_fan/config", "", true);
+	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR("miot-test/miot/fan/get", "", true);
+	// Pending discovery cannot resurrect an entity after removal.
+	CMD_ExecuteCommand("miotFan 1 2 3 4", 0);
+	MIoT_OnHassDiscovery("homeassistant");
+	CMD_ExecuteCommand("miotFan off", 0);
+	SIM_ClearMQTTHistory();
+	Sim_RunSeconds(4, false);
+	SELFTEST_ASSERT_HAS_NOT_MQTT_JSON_SENT_ANY("homeassistant/fan/miot-fan_fan/config", false, NULL, NULL, "cmd_t", "cmnd/miot-test/miotSet");
+	// Re-enabling before tombstones drain must preserve the new config and state.
+	CMD_ExecuteCommand("miotFan 1 2 3 4", 0);
+	MIoT_OnHassDiscovery("homeassistant");
+	CMD_ExecuteCommand("miotFan off", 0);
+	CMD_ExecuteCommand("miotFan 1 2 3 4", 0);
+	MIoT_OnHassDiscovery("homeassistant");
+	SIM_ClearMQTTHistory();
+	Sim_RunSeconds(4, false);
+	SELFTEST_ASSERT_HAS_MQTT_JSON_SENT("homeassistant/fan/miot-fan_fan/config", false);
+	SELFTEST_ASSERT(!SIM_CheckMQTTHistoryForString("miot-test/miot/fan/get", "", true));
+	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR("miot-test/miot/fan/get", snapshot, true);
+	CMD_ExecuteCommand("miotFan off", 0);
+	Sim_RunSeconds(4, false);
+	// The longest valid device name must fit both identifiers, including the suffix.
+	memset(name, 'x', sizeof(name) - 1);
+	name[sizeof(name) - 1] = 0;
+	CFG_SetDeviceName(name);
+	CMD_ExecuteCommand("miotFan 1 2 3 4", 0);
+	MIoT_OnHassDiscovery("homeassistant");
+	SIM_ClearMQTTHistory();
+	Sim_RunSeconds(4, false);
+	snprintf(uniqueId, sizeof(uniqueId), "%s_select_fan", name);
+	snprintf(topic, sizeof(topic), "homeassistant/select/%s/config", uniqueId);
+	SELFTEST_ASSERT_HAS_MQTT_JSON_SENT(topic, false);
+	SELFTEST_ASSERT_JSON_VALUE_STRING(NULL, "uniq_id", uniqueId);
+	CMD_ExecuteCommand("miotFan off", 0);
+	Sim_RunSeconds(4, false);
+	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR(topic, "", true);
+	CMD_ExecuteCommand("stopDriver MIoT", 0);
+}
+
 void Test_MIoT(void) {
 	int i;
 	MIoT_TestCallbacks();
@@ -330,6 +429,7 @@ void Test_MIoT(void) {
 	SELFTEST_ASSERT(CMD_ExecuteCommand("miotSet 2 5 37", 0) == CMD_RES_BAD_ARGUMENT);
 	SELFTEST_ASSERT_HAS_UART_EMPTY();
 	MIoT_TestNetworkReset();
+	MIoT_TestFanDiscovery();
 }
 #endif
 #endif

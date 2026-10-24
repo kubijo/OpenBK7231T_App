@@ -50,6 +50,8 @@ typedef struct energySensorNames_s {
 extern int g_dhtsCount;
 
 void DRV_Generic_Init();
+bool DRV_Mutex_Take(int del);
+void DRV_Mutex_Free(void);
 void DRV_OnHassDiscovery(const char *topic);
 void DRV_AppendInformationToHTTPIndexPage(http_request_t* request, int bPreState);
 void DRV_OnEverySecond();
@@ -93,4 +95,3 @@ bool TuyaMCU_IsLEDRunning();
 void Shutter_MoveByIndex(int index, float frac, bool bStopOnDuplicate);
 
 #endif /* __DRV_PUBLIC_H__ */
-

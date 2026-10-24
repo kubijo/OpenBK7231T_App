@@ -65,7 +65,7 @@ static driver_t g_drivers[] = {
 	MIoT_RunFrame,                           // runQuickTick
 	MIoT_Stop,                               // stopFunction
 	MIoT_OnChannelChanged,                   // onChannelChanged
-	NULL,                                    // onHassDiscovery
+	MIoT_OnHassDiscovery,                    // onHassDiscovery
 	false,                                   // loaded
 	},
 #endif

@@ -19,26 +19,51 @@ defaults to one and constrains outgoing values relative to `Min`. Boolean mappin
 require bounds zero and one. Property identifiers and channels must be unique.
 Mappings are recreated by the startup script after reboot.
 
-For the Xiaomi tower fan p45, the following core controls have been tested against
-the stock MCU firmware running in an emulator:
-
-```text
-startDriver MIoT
-miotMap 2 1 1 bool 0 1 1
-miotMap 2 5 2 int 1 100 1
-miotMap 2 6 3 bool 0 1 1
-miotMap 2 7 4 int 30 150 1 30
-```
-
-These map power, speed percentage, oscillation, and swing angle to channels 1–4.
-Configure channel types and labels with the usual OpenBeken commands. This driver
-does not register a Home Assistant fan entity.
+The [Xiaomi tower fan p45 preset](autoexecs/Xiaomi-Smart-Tower-Fan-2-p45.bat)
+maps power, speed percentage, oscillation, and swing angle to channels 1–4 and
+enables Home Assistant discovery. Copy its contents into the device's LittleFS
+`autoexec.bat` after selecting the correct UART. This is OpenBeken's startup
+command format. The four controls have been tested against the stock MCU image;
+the board's UART assignment and physical behavior still require verification.
 
 Use channel commands or `miotSet SIID PIID Value` to request a write. `miotSet`
 requires literal `true` or `false` for a boolean; channel writes use zero or one.
 `miotRead SIID PIID` requests a fresh read and `miotPoll` refreshes every mapping.
 For example, queue `miotSet 2 1 true` before `miotSet 2 5 37`: the p45 MCU ignores
 speed and oscillation changes while power is off, even when its result says success.
+
+## Home Assistant
+
+On builds with MQTT and Home Assistant discovery enabled, bind four existing
+writable mappings with:
+
+```text
+miotFan PowerChannel SpeedChannel OscillationChannel AngleChannel
+```
+
+The binding creates a fan with power, percentage, and oscillation, plus a swing
+angle select on the same device. Power and oscillation must be boolean; speed
+must be an integer range starting at one or greater with a step of one. The
+angle mapping must provide between two and sixteen integer options. Invalid
+bindings leave the previous configuration unchanged. The transport remains
+generic: SIID/PIID values come from the selected mappings, not a device model.
+
+Discovery uses the normal OpenBeken device identity, discovery prefix, and MQTT
+availability topic. Commands use `miotSet` without MQTT retention. Setting fan
+percentage to zero turns power off; turning on with a percentage sends power
+before speed. Additional modes, timers, and actions are not advertised.
+
+The retained `<client-id>/miot/fan/get` JSON snapshot contains `power`, `speed`,
+`oscillation`, and `angle`. It is published only after all four mappings have
+MCU-confirmed values. A successful write result or a speculative local channel
+change does not establish confirmed state. Discovery and the latest confirmed
+snapshot are republished after MQTT reconnect. `miotFan off` or stopping the
+driver removes its retained discovery and state; mappings and channel control
+remain available after `miotFan off`.
+
+MQTT availability describes the module's broker connection, not MCU or motor
+health. Until readback arrives, a retained snapshot represents the last known
+MCU state.
 
 ## State and recovery
 
@@ -99,5 +124,7 @@ Renode bridge runs the compiled host driver against the unmodified p45 MCU image
 for the four core controls and button-triggered network recovery. Its parent-owned
 harness observes reboot/AP callbacks and reloads simulator flash in a fresh process;
 radio behavior and BL602 EasyFlash persistence need separate verification.
+An isolated Home Assistant/Mosquitto lab exercises real discovery, services,
+confirmed state, entity identity, and recovery through this host/MCU bridge.
 The BL602 build checks target compilation; physical pins, electrical timing, motor
 behavior, and running the driver on BL602 silicon require separate verification.
