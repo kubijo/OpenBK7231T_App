@@ -1313,7 +1313,6 @@ static int MQTT_do_connect(mqtt_client_t* client)
 	// host name/ip
 	if (NULL != hostEntry)
 	{
-#ifndef LINUX
 		if (hostEntry->h_addr_list && hostEntry->h_addr_list[0]) {
 			int len = hostEntry->h_length;
 			if (len > 4) {
@@ -1322,8 +1321,7 @@ static int MQTT_do_connect(mqtt_client_t* client)
 			}
 			memcpy(&mqtt_ip, hostEntry->h_addr_list[0], len);
 		}
-		else 
-#endif
+		else
 		{
 			addLogAdv(LOG_INFO, LOG_FEATURE_MQTT, "mqtt_host resolves no addresses?");
 			snprintf(mqtt_status_message, sizeof(mqtt_status_message), "mqtt_host resolves no addresses?");

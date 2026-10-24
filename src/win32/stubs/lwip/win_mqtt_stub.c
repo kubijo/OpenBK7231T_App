@@ -1373,7 +1373,7 @@ void WIN_RunMQTTClient(mqtt_client_t *cl) {
 		FD_SET(cl->conn->sock, &fd);
 		time.tv_sec = 0;
 		time.tv_usec = 0;
-		if (select(0, NULL, &fd, NULL, &time) == 1) {
+		if (select(cl->conn->sock + 1, NULL, &fd, NULL, &time) == 1) {
 			int error = 0;
 			unsigned int len = sizeof(error);
 			getsockopt(cl->conn->sock, SOL_SOCKET, SO_ERROR, (char*)&error, &len);
@@ -1402,7 +1402,7 @@ void WIN_RunMQTTClient(mqtt_client_t *cl) {
 		}
 		else {
 			err = GETSOCKETERRNO();
-			if (err == WSAEWOULDBLOCK) {
+			if (len < 0 && err == WSAEWOULDBLOCK) {
 
 			}
 			else {
