@@ -2,6 +2,7 @@
 
 #include "selftest_local.h"
 #include "../hal/hal_wifi.h"
+#include "../mqtt/new_mqtt.h"
 
 void SIM_ClearAndPrepareForMQTTTesting(const char *clientName, const char *groupName) {
 	SIM_ClearOBK(0);
@@ -43,6 +44,18 @@ void Test_MQTT_Get_And_Reply() {
 		SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR(buffer2, buffer, false);
 		SIM_ClearMQTTHistory();
 	}
+	// Cancellation matches the complete topic/channel and preserves queue accounting.
+	MQTT_QueuePublish("cancel-test", "state", "stale-1", OBK_PUBLISH_FLAG_RETAIN);
+	MQTT_QueuePublish("cancel-test", "state", "stale-2", OBK_PUBLISH_FLAG_RETAIN);
+	MQTT_QueuePublish("cancel-test", "state-other", "keep", OBK_PUBLISH_FLAG_RETAIN);
+	SELFTEST_ASSERT(MQTT_CancelQueuedPublish("cancel-test", "state"));
+	SELFTEST_ASSERT(MQTT_CancelQueuedPublish("cancel-test", "state"));
+	MQTT_QueuePublish("cancel-test", "state", "fresh", OBK_PUBLISH_FLAG_RETAIN);
+	Sim_RunSeconds(4, false);
+	SELFTEST_ASSERT(!SIM_CheckMQTTHistoryForString("cancel-test/state", "stale-1", true));
+	SELFTEST_ASSERT(!SIM_CheckMQTTHistoryForString("cancel-test/state", "stale-2", true));
+	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR("cancel-test/state-other", "keep", true);
+	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR("cancel-test/state", "fresh", true);
 }
 void Test_MQTT_Channels() {
 	SIM_ClearOBK(0);

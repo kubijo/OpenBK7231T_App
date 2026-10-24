@@ -886,7 +886,7 @@ static void mqtt_pub_request_cb(void* arg, err_t result)
 }
 
 // This publishes value to the specified topic/channel.
-static OBK_Publish_Result MQTT_PublishTopicToClient(mqtt_client_t* client, const char* sTopic, const char* sChannel, const char* sVal, int flags, bool appendGet)
+static OBK_Publish_Result MQTT_PublishTopicToClientUnlocked(mqtt_client_t* client, const char* sTopic, const char* sChannel, const char* sVal, int flags, bool appendGet)
 {
 	err_t err;
 	u8_t qos = 1; /* 0 1 or 2, see MQTT specification */
@@ -901,20 +901,6 @@ static OBK_Publish_Result MQTT_PublishTopicToClient(mqtt_client_t* client, const
 	if (client == 0)
 		return OBK_PUBLISH_WAS_DISCONNECTED;
 
-	if (flags & OBK_PUBLISH_FLAG_MUTEX_SILENT)
-	{
-		if (MQTT_Mutex_Take(100) == 0)
-		{
-			return OBK_PUBLISH_MUTEX_FAIL;
-		}
-	}
-	else {
-		if (MQTT_Mutex_Take(500) == 0)
-		{
-			addLogAdv(LOG_ERROR, LOG_FEATURE_MQTT, "MQTT_PublishTopicToClient: mutex failed for %s=%s", sChannel, sVal);
-			return OBK_PUBLISH_MUTEX_FAIL;
-		}
-	}
 	if (flags & OBK_PUBLISH_FLAG_RETAIN)
 	{
 		retain = 1;
@@ -941,7 +927,6 @@ static OBK_Publish_Result MQTT_PublishTopicToClient(mqtt_client_t* client, const
 	if (res == 0)
 	{
 		g_my_reconnect_mqtt_after_time = 5;
-		MQTT_Mutex_Free();
 		return OBK_PUBLISH_WAS_DISCONNECTED;
 	}
 
@@ -987,17 +972,29 @@ static OBK_Publish_Result MQTT_PublishTopicToClient(mqtt_client_t* client, const
 				addLogAdv(LOG_ERROR, LOG_FEATURE_MQTT, "Publish err: %d", err);
 			}
 			mqtt_publish_errors++;
-			MQTT_Mutex_Free();
 			return OBK_PUBLISH_MEM_FAIL;
 		}
 		mqtt_published_events++;
-		MQTT_Mutex_Free();
 		return OBK_PUBLISH_OK;
 	}
 	else {
-		MQTT_Mutex_Free();
 		return OBK_PUBLISH_MEM_FAIL;
 	}
+}
+
+static OBK_Publish_Result MQTT_PublishTopicToClient(mqtt_client_t* client, const char* sTopic, const char* sChannel, const char* sVal, int flags, bool appendGet)
+{
+	OBK_Publish_Result result;
+	if (client == NULL)
+		return OBK_PUBLISH_WAS_DISCONNECTED;
+	if (!MQTT_Mutex_Take((flags & OBK_PUBLISH_FLAG_MUTEX_SILENT) ? 100 : 500)) {
+		if (!(flags & OBK_PUBLISH_FLAG_MUTEX_SILENT))
+			addLogAdv(LOG_ERROR, LOG_FEATURE_MQTT, "MQTT_PublishTopicToClient: mutex failed for %s=%s", sChannel, sVal);
+		return OBK_PUBLISH_MUTEX_FAIL;
+	}
+	result = MQTT_PublishTopicToClientUnlocked(client, sTopic, sChannel, sVal, flags, appendGet);
+	MQTT_Mutex_Free();
+	return result;
 }
 
 // This is used to publish channel values in "obk0696FB33/1/get" format with numerical value,
@@ -2458,7 +2455,7 @@ MqttPublishItem_t* find_queue_reusable_item(MqttPublishItem_t* head) {
 /// @param value 
 /// @param flags
 /// @param command Command to execute after the publish
-void MQTT_QueuePublishWithCommand(const char* topic, const char* channel, const char* value, int flags, PostPublishCommands command) {
+static void MQTT_QueuePublishWithCommandUnlocked(const char* topic, const char* channel, const char* value, int flags, PostPublishCommands command) {
 	MqttPublishItem_t* newItem;
 	if (g_MqttPublishItemsQueued >= MQTT_MAX_QUEUE_SIZE) {
 		addLogAdv(LOG_ERROR, LOG_FEATURE_MQTT, "Unable to queue! %i items already present", g_MqttPublishItemsQueued);
@@ -2509,13 +2506,17 @@ void MQTT_QueuePublishWithCommand(const char* topic, const char* channel, const 
 /// @brief Add the specified command to the last entry in the queue.
 /// @param command 
 void MQTT_InvokeCommandAtEnd(PostPublishCommands command) {
-	MqttPublishItem_t* tail = get_queue_tail(g_MqttPublishQueueHead);
+	MqttPublishItem_t* tail;
+	if (!MQTT_Mutex_Take(500))
+		return;
+	tail = get_queue_tail(g_MqttPublishQueueHead);
 	if (tail == NULL){
 		addLogAdv(LOG_ERROR, LOG_FEATURE_MQTT, "InvokeCommandAtEnd invoked but queue is empty");
 	}
 	else {
 		tail->command = command;
 	}
+	MQTT_Mutex_Free();
 }
 
 /// @brief Queue an entry for publish.
@@ -2523,6 +2524,31 @@ void MQTT_InvokeCommandAtEnd(PostPublishCommands command) {
 /// @param channel 
 /// @param value 
 /// @param flags
+void MQTT_QueuePublishWithCommand(const char* topic, const char* channel, const char* value, int flags, PostPublishCommands command) {
+	if (!MQTT_Mutex_Take(500))
+		return;
+	MQTT_QueuePublishWithCommandUnlocked(topic, channel, value, flags, command);
+	MQTT_Mutex_Free();
+}
+
+// Queue mutation and publication share the mutex, so cancellation cannot race a claimed item.
+bool MQTT_CancelQueuedPublish(const char* topic, const char* channel) {
+	MqttPublishItem_t* item;
+	if (!MQTT_Mutex_Take(500))
+		return false;
+	item = g_MqttPublishQueueHead;
+	while (item != NULL) {
+		if (!MQTT_QUEUE_ITEM_IS_REUSABLE(item) &&
+			!strcmp(item->topic, topic) && !strcmp(item->channel, channel)) {
+			MQTT_QUEUE_ITEM_SET_REUSABLE(item);
+			g_MqttPublishItemsQueued--;
+		}
+		item = item->next;
+	}
+	MQTT_Mutex_Free();
+	return true;
+}
+
 void MQTT_QueuePublish(const char* topic, const char* channel, const char* value, int flags) {
 	MQTT_QueuePublishWithCommand(topic, channel, value, flags, None);
 }
@@ -2540,16 +2566,21 @@ OBK_Publish_Result PublishQueuedItems() {
 	//so this traversal is fast.
 	//addLogAdv(LOG_INFO,LOG_FEATURE_MQTT,"PublishQueuedItems g_MqttPublishItemsQueued=%i",g_MqttPublishItemsQueued );
 	while ((head != NULL) && (count < MQTT_QUEUED_ITEMS_PUBLISHED_AT_ONCE) && (g_MqttPublishItemsQueued > 0)) {
+		PostPublishCommands command;
+		if (!MQTT_Mutex_Take(500))
+			return OBK_PUBLISH_MUTEX_FAIL;
 		if (!MQTT_QUEUE_ITEM_IS_REUSABLE(head)) {  //Skip reusable entries
 			count++;
-			result = MQTT_PublishTopicToClient(mqtt_client, head->topic, head->channel, head->value, head->flags, false);
+			result = MQTT_PublishTopicToClientUnlocked(mqtt_client, head->topic, head->channel, head->value, head->flags, false);
+			command = head->command;
 			MQTT_QUEUE_ITEM_SET_REUSABLE(head); //Flag item as reusable
 			g_MqttPublishItemsQueued--;   //decrement queued count
+			MQTT_Mutex_Free();
 
 			//Stop if last publish failed
 			if (result != OBK_PUBLISH_OK) break;
 
-			switch (head->command) {
+			switch (command) {
 			case None:
 				break;
 			case PublishAll:
@@ -2561,6 +2592,7 @@ OBK_Publish_Result PublishQueuedItems() {
 			}
 		}
 		else {
+			MQTT_Mutex_Free();
 			//addLogAdv(LOG_INFO,LOG_FEATURE_MQTT,"PublishQueuedItems item skipped reusable");
 		}
 

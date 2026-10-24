@@ -158,6 +158,7 @@ OBK_Publish_Result MQTT_PublishMain_StringInt(const char* sChannel, int val, int
 OBK_Publish_Result MQTT_PublishMain_StringString(const char* sChannel, const char* valueStr, int flags);
 void MQTT_PublishOnlyDeviceChannelsIfPossible();
 void MQTT_QueuePublish(const char* topic, const char* channel, const char* value, int flags);
+bool MQTT_CancelQueuedPublish(const char* topic, const char* channel);
 void MQTT_QueuePublishWithCommand(const char* topic, const char* channel, const char* value, int flags, PostPublishCommands command);
 OBK_Publish_Result MQTT_Publish(const char* sTopic, const char* sChannel, const char* value, int flags);
 OBK_Publish_Result MQTT_PublishStat(const char* statName, const char* statValue);
