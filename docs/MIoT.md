@@ -54,6 +54,9 @@ a missing result. Success replies alone never establish channel state. MCU chang
 notifications and successful reads update channels without echoing another write.
 OpenBeken's ordinary channel commands initially change the local channel value;
 readback reconciles it when the MCU leaves the requested value unchanged.
+Rejected channel values are reconciled on the next driver tick, after the outer
+GPIO and event callbacks finish. Incoming updates suppress their direct echo;
+automations can still request another value on that same channel.
 
 Outgoing values are checked against the configured type, bounds, and step.
 Incoming values must match their type and bounds; a value between advertised steps

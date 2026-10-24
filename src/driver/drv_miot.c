@@ -3,7 +3,6 @@
 #include "../cmnds/cmd_public.h"
 #include "../hal/hal_wifi.h"
 #include "../logging/logging.h"
-#include "../new_cfg.h"
 #include "../new_common.h"
 #include "../new_pins.h"
 #include "../quicktick.h"
@@ -22,7 +21,7 @@
 
 typedef struct {
 	int siid, piid, channel, min, max, step;
-	bool boolean, writable, known, read;
+	bool boolean, writable, known, read, reconcile;
 	int value;
 } miotProperty_t;
 
@@ -42,11 +41,18 @@ static miotPending_t pending;
 static int pendingProperty;
 static unsigned int pendingSince, lastByte;
 static int uartGeneration;
+static int uartPort;
+static unsigned int sessionGeneration;
 static bool running, dropping;
 static int applyingChannel = -1;
+static int applyingValue;
 static char line[MIOT_LINE + 1];
 static size_t lineLength;
 static unsigned int pollSeconds;
+
+static bool MIoT_IsCurrent(unsigned int generation) {
+	return running && sessionGeneration == generation && uartPort == UART_GetSelectedPortIndex() && uartGeneration == get_g_uart_init_counter();
+}
 
 static bool MIoT_Int(const char *text, int *value) {
 	char *end;
@@ -90,9 +96,11 @@ static int MIoT_Find(int siid, int piid) {
 }
 
 static void MIoT_Send(const char *text) {
-	while (*text)
+	unsigned int generation = sessionGeneration;
+	while (*text && MIoT_IsCurrent(generation))
 		UART_SendByte((byte)*text++);
-	UART_SendByte('\r');
+	if (MIoT_IsCurrent(generation))
+		UART_SendByte('\r');
 }
 
 static void MIoT_ReadAll(void) {
@@ -105,8 +113,10 @@ static void MIoT_ResetSession(void) {
 	int i;
 	queueHead = queueCount = 0;
 	pending = MIOT_IDLE;
-	for (i = 0; i < propertyCount; i++)
+	for (i = 0; i < propertyCount; i++) {
 		properties[i].known = false;
+		properties[i].reconcile = false;
+	}
 	MIoT_ReadAll();
 }
 
@@ -127,11 +137,18 @@ static bool MIoT_Value(int index, const char *text, int *value) {
 static void MIoT_Apply(int index, int value) {
 	miotProperty_t *p = &properties[index];
 	int previous = applyingChannel;
+	int previousValue = applyingValue;
+	unsigned int generation = sessionGeneration;
 	p->known = true;
 	p->value = value;
+	p->reconcile = false;
 	applyingChannel = p->channel;
+	applyingValue = value;
 	CHANNEL_Set(p->channel, value, 0);
-	applyingChannel = previous;
+	if (sessionGeneration == generation) {
+		applyingChannel = previous;
+		applyingValue = previousValue;
+	}
 }
 
 static bool MIoT_QueueWrite(int index, int value) {
@@ -188,6 +205,7 @@ static void MIoT_Poll(void) {
 }
 
 static bool MIoT_Properties(char **tokens, int count, bool result) {
+	unsigned int generation = sessionGeneration;
 	int i, siid, piid, code, index, value;
 	int indices[MIOT_PROPERTIES], values[MIOT_PROPERTIES], found = 0;
 	int stride = 3;
@@ -223,12 +241,16 @@ static bool MIoT_Properties(char **tokens, int count, bool result) {
 		indices[found] = index;
 		values[found++] = value;
 	}
-	for (i = 0; i < found; i++)
+	for (i = 0; i < found; i++) {
 		MIoT_Apply(indices[i], values[i]);
+		if (!MIoT_IsCurrent(generation))
+			return false;
+	}
 	return true;
 }
 
 static void MIoT_Process(void) {
+	unsigned int generation = sessionGeneration;
 	char *tokens[MIOT_TOKENS];
 	char reply[64];
 	int count = MIoT_Tokenize(line, tokens, MIOT_TOKENS);
@@ -243,9 +265,13 @@ static void MIoT_Process(void) {
 		addLogAdv(LOG_INFO, LOG_FEATURE_DRV, "MIoT model %s", tokens[1]);
 		MIoT_Send("ok");
 	} else if (!strcmp(tokens[0], "properties_changed")) {
-		MIoT_Send(MIoT_Properties(tokens, count, false) ? "ok" : "error");
+		bool valid = MIoT_Properties(tokens, count, false);
+		if (MIoT_IsCurrent(generation))
+			MIoT_Send(valid ? "ok" : "error");
 	} else if (!strcmp(tokens[0], "result")) {
 		bool valid = MIoT_Properties(tokens, count, true);
+		if (!MIoT_IsCurrent(generation))
+			return;
 		if (pending == MIOT_WRITE)
 			properties[pendingProperty].read = true;
 		pending = MIOT_IDLE;
@@ -274,14 +300,22 @@ static void MIoT_Process(void) {
 }
 
 void MIoT_RunFrame(void) {
-	int c;
-	if (!running || uartGeneration != get_g_uart_init_counter())
+	int c, i;
+	unsigned int generation = sessionGeneration;
+	if (!MIoT_IsCurrent(generation))
 		return;
+	// Reconcile after Channel_OnChanged has finished its GPIO and event work.
+	for (i = 0; i < propertyCount; i++) {
+		if (properties[i].reconcile)
+			MIoT_Apply(i, properties[i].value);
+		if (!MIoT_IsCurrent(generation))
+			return;
+	}
 	if (lineLength && (unsigned int)(g_timeMs - lastByte) > MIOT_TIMEOUT) {
 		lineLength = 0;
 		dropping = true;
 	}
-	while (UART_GetDataSize()) {
+	while (MIoT_IsCurrent(generation) && UART_GetDataSize()) {
 		c = UART_GetByte(0);
 		UART_ConsumeBytes(1);
 		lastByte = g_timeMs;
@@ -291,6 +325,8 @@ void MIoT_RunFrame(void) {
 				MIoT_Send("error");
 			else
 				MIoT_Process();
+			if (!MIoT_IsCurrent(generation))
+				return;
 			lineLength = 0;
 			dropping = false;
 		} else if (c == '\n' && !lineLength && !dropping) {
@@ -304,7 +340,7 @@ void MIoT_RunFrame(void) {
 }
 
 void MIoT_RunEverySecond(void) {
-	if (!running)
+	if (!MIoT_IsCurrent(sessionGeneration))
 		return;
 	if (pending != MIOT_IDLE && (unsigned int)(g_timeMs - pendingSince) >= MIOT_TIMEOUT) {
 		properties[pendingProperty].read = true;
@@ -318,14 +354,22 @@ void MIoT_RunEverySecond(void) {
 
 void MIoT_OnChannelChanged(int channel, int value) {
 	int i;
-	if (!running || channel == applyingChannel)
+	if (!MIoT_IsCurrent(sessionGeneration))
 		return;
+	// Consume only the direct echo. Scripts run later in CHANNEL_Set and may
+	// deliberately request a different value on this same channel.
+	if (channel == applyingChannel && value == applyingValue) {
+		applyingChannel = -1;
+		return;
+	}
 	for (i = 0; i < propertyCount; i++) {
 		if (properties[i].channel != channel)
 			continue;
 		if (!MIoT_QueueWrite(i, value)) {
 			if (properties[i].known)
-				MIoT_Apply(i, properties[i].value);
+				properties[i].reconcile = true;
+			else
+				properties[i].read = true;
 			addLogAdv(LOG_WARN, LOG_FEATURE_DRV, "MIoT rejected channel %i value %i", channel, value);
 		}
 		return;
@@ -337,7 +381,7 @@ static commandResult_t MIoT_Command(const void *context, const char *cmd, const 
 	int count, siid, piid, index, value;
 	(void)context;
 	(void)flags;
-	if (!running || strlen(args) >= sizeof(buffer))
+	if (!MIoT_IsCurrent(sessionGeneration) || strlen(args) >= sizeof(buffer))
 		return CMD_RES_BAD_ARGUMENT;
 	strcpy(buffer, args);
 	count = MIoT_Tokenize(buffer, tokens, 9);
@@ -387,6 +431,7 @@ static commandResult_t MIoT_Command(const void *context, const char *cmd, const 
 }
 
 void MIoT_Init(void) {
+	sessionGeneration++;
 	propertyCount = 0;
 	lineLength = 0;
 	dropping = false;
@@ -394,6 +439,7 @@ void MIoT_Init(void) {
 	pollSeconds = 0;
 	MIoT_ResetSession();
 	UART_InitReceiveRingBuffer(2048);
+	uartPort = UART_GetSelectedPortIndex();
 	uartGeneration = UART_InitUART(115200, 0, false);
 	running = true;
 	// clang-format off
@@ -418,6 +464,7 @@ void MIoT_Init(void) {
 
 void MIoT_Stop(void) {
 	running = false;
+	sessionGeneration++;
 	MIoT_ResetSession();
 	propertyCount = 0;
 	lineLength = 0;

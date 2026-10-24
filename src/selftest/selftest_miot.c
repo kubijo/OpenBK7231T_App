@@ -44,8 +44,49 @@ static void MIoT_TestSetup(void) {
 	MIoT_TestExpect("ok\rdown none\r");
 }
 
+static void MIoT_TestCallbacks(void) {
+	MIoT_TestSetup();
+	CMD_ExecuteCommand("setPinChannel 6 2", 0);
+	CMD_ExecuteCommand("setPinRole 6 Rel", 0);
+	CMD_ExecuteCommand("addChangeHandler Channel2 == 1 addChannel 10 1", 0);
+	CHANNEL_Set(2, 0, 0);
+	DRV_RunQuickTick();
+	SELFTEST_ASSERT_CHANNEL(2, 1);
+	SELFTEST_ASSERT_PIN_BOOLEAN(6, 1);
+	SELFTEST_ASSERT_CHANNEL(10, 1);
+	MIoT_TestReceive("properties_changed 2 5 1\r");
+	MIoT_TestExpect("ok\r");
+	SELFTEST_ASSERT_PIN_BOOLEAN(6, 1);
+
+	MIoT_TestSetup();
+	CMD_ExecuteCommand("addChangeHandler Channel1 == 1 setChannel 1 0", 0);
+	MIoT_TestReceive("properties_changed 2 1 true\rget_down\r");
+	MIoT_TestExpect("ok\rdown set_properties 2 1 false\r");
+	SELFTEST_ASSERT_CHANNEL(1, 0);
+
+	MIoT_TestSetup();
+	CMD_ExecuteCommand("addChangeHandler Channel1 == 1 backlog uartInit 9600; uartFakeHex 6765745f646f776e0d", 0);
+	MIoT_TestReceive("properties_changed 2 1 true\r");
+	SELFTEST_ASSERT_HAS_UART_EMPTY();
+	SELFTEST_ASSERT(UART_GetDataSize() == 9);
+	DRV_RunQuickTick();
+	SELFTEST_ASSERT_HAS_UART_EMPTY();
+	SELFTEST_ASSERT(UART_GetDataSize() == 9);
+
+	// A stop/start callback replaces the session even though MIoT owns the new
+	// UART. The old parser must not ACK or publish its remaining property tuples.
+	MIoT_TestSetup();
+	CMD_ExecuteCommand("addChangeHandler Channel1 == 1 backlog stopDriver MIoT; startDriver MIoT; miotMap 2 5 4 int 1 100 1", 0);
+	MIoT_TestReceive("properties_changed 2 1 true 2 5 37\r");
+	SELFTEST_ASSERT_HAS_UART_EMPTY();
+	SELFTEST_ASSERT_CHANNEL(4, 0);
+	MIoT_TestReceive("get_down\r");
+	MIoT_TestExpect("down get_properties 2 5\r");
+}
+
 void Test_MIoT(void) {
 	int i;
+	MIoT_TestCallbacks();
 	MIoT_TestSetup();
 	// Mapping and outgoing values have strict syntax, types and bounds.
 	SELFTEST_ASSERT(CMD_ExecuteCommand("miotMap 2 1 4 bool 0 1 1", 0) == CMD_RES_BAD_ARGUMENT);
