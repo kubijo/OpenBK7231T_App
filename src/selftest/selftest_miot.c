@@ -317,6 +317,98 @@ static void MIoT_TestFanDiscovery(void) {
 	CMD_ExecuteCommand("stopDriver MIoT", 0);
 }
 
+static void MIoT_TestFanEnums(void) {
+	char name[64], topic[128];
+	SIM_ClearOBK(0);
+	SIM_ClearAndPrepareForMQTTTesting("miot-test", "bekens");
+	CFG_SetDeviceName("miot-fan");
+	SIM_UART_InitReceiveRingBuffer(8192);
+	CMD_ExecuteCommand("startDriver MIoT", 0);
+	CMD_ExecuteCommand("miotMap 2 1 1 bool 0 1 1", 0);
+	CMD_ExecuteCommand("miotMap 2 5 2 int 1 100 1", 0);
+	CMD_ExecuteCommand("miotMap 2 6 3 bool 0 1 1", 0);
+	CMD_ExecuteCommand("miotMap 2 7 4 int 30 150 1 30", 0);
+	CMD_ExecuteCommand("miotMap 2 3 5 int 0 2 1", 0);
+	CMD_ExecuteCommand("miotMap 2 4 6 int 1 4 1", 0);
+	CMD_ExecuteCommand("miotMap 12 2 7 int 0 480 1", 0);
+	CMD_ExecuteCommand("miotMap 12 3 8 int 0 480 0", 0);
+	CMD_ExecuteCommand("miotMap 99 1 9 int 0 479 0", 0);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFanTimer 7 8", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFanEnum preset 5 Direct Natural Sleep", 0) == CMD_RES_BAD_ARGUMENT);
+	CMD_ExecuteCommand("miotFan 1 2 3 4", 0);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFanEnum preset 5 Direct Natural Sleep", 0) == CMD_RES_OK);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFanEnum profile 6 Lakeside Campsite Orchard Terraced_Field", 0) == CMD_RES_OK);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFanTimer 7 8", 0) == CMD_RES_OK);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFanTimer 7", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFanTimer 8 7", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFanTimer 7 7", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFanTimer 7 9", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFanTimer 1 8", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotSet 12 2 481", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotSet 12 3 1", 0) == CMD_RES_ERROR);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFanEnum preset 5 Direct Natural", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFanEnum preset 5 Direct Direct Sleep", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFanEnum preset 5 Direct 'Natural' Sleep", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFanEnum preset 5 Direct _ Sleep", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFanEnum profile 5 Direct Natural Sleep", 0) == CMD_RES_BAD_ARGUMENT);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFan 1 5 3 4", 0) == CMD_RES_BAD_ARGUMENT);
+	// Individually valid label/client lengths can exceed the discovery JSON budget.
+	// Rejection must preserve the previously configured labels and retained entity.
+	memset(name, 'x', sizeof(name) - 1);
+	name[sizeof(name) - 1] = 0;
+	CFG_SetDeviceName(name);
+	CFG_SetMQTTClientId(name);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFanEnum preset 5 AAAAAAAAAAAAAAAAAAAAAAA BBBBBBBBBBBBBBBBBBBBBBB CCCCCCCCCCCCCCCCCCCCCCC", 0) == CMD_RES_BAD_ARGUMENT);
+	CFG_SetDeviceName("miot-fan");
+	CFG_SetMQTTClientId("miot-test");
+	MIoT_OnHassDiscovery("homeassistant");
+	SIM_ClearMQTTHistory();
+	Sim_RunSeconds(7, false);
+	SELFTEST_ASSERT_HAS_MQTT_JSON_SENT("homeassistant/fan/miot-fan_fan/config", false);
+	SELFTEST_ASSERT_JSON_VALUE_STRING(NULL, "pr_mode_stat_t", "~/miot/fan/get");
+	SELFTEST_ASSERT_JSON_VALUE_STRING(NULL, "pr_mode_cmd_tpl", "2 3 {{ ['Direct','Natural','Sleep'].index(value) + (0) }}");
+	SELFTEST_ASSERT_HAS_MQTT_JSON_SENT("homeassistant/select/miot-fan_select_pr/config", false);
+	SELFTEST_ASSERT_JSON_VALUE_STRING(NULL, "name", "Natural wind profile");
+	SELFTEST_ASSERT_HAS_MQTT_JSON_SENT("homeassistant/number/miot-fan_number_0_t/config", false);
+	SELFTEST_ASSERT_JSON_VALUE_STRING(NULL, "cmd_tpl", "12 2 {{value|int}}");
+	SELFTEST_ASSERT_HAS_MQTT_JSON_SENT("homeassistant/sensor/miot-fan_sensor_0_r/config", false);
+	SELFTEST_ASSERT_JSON_VALUE_STRING(NULL, "unit_of_meas", "min");
+	MIoT_TestReceive("properties_changed 2 1 true 2 5 37 2 6 true 2 7 90 2 3 1\r");
+	MIoT_TestExpect("ok\r");
+	SIM_ClearMQTTHistory();
+	Sim_RunSeconds(2, false);
+	SELFTEST_ASSERT(SIM_GetMQTTHistoryString("miot-test/miot/fan/get", false) == NULL);
+	MIoT_TestReceive("properties_changed 2 4 4 12 2 2 12 3 2\r");
+	MIoT_TestExpect("ok\r");
+	Sim_RunSeconds(2, false);
+	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR("miot-test/miot/fan/get", "{\"power\":true,\"speed\":37,\"oscillation\":true,\"angle\":90,\"mode\":1,\"profile\":4,\"timer\":2,\"remaining\":2}", true);
+	CMD_ExecuteCommand("miotFan off", 0);
+	Sim_RunSeconds(7, false);
+	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR("homeassistant/select/miot-fan_select_pr/config", "", true);
+	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR("homeassistant/number/miot-fan_number_0_t/config", "", true);
+	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR("homeassistant/sensor/miot-fan_sensor_0_r/config", "", true);
+	memset(name, 'x', sizeof(name) - 1);
+	name[sizeof(name) - 1] = 0;
+	CFG_SetDeviceName(name);
+	CMD_ExecuteCommand("miotFan 1 2 3 4", 0);
+	MIoT_OnHassDiscovery("homeassistant");
+	SIM_ClearMQTTHistory();
+	Sim_RunSeconds(7, false);
+	snprintf(topic, sizeof(topic), "homeassistant/fan/%s_fan/config", name);
+	SELFTEST_ASSERT_HAS_MQTT_JSON_SENT(topic, false);
+	SELFTEST_ASSERT_JSON_VALUE_STRING(NULL, "pr_mode_stat_t", "~/miot/fan/get");
+	snprintf(topic, sizeof(topic), "homeassistant/select/%s_select_pr/config", name);
+	SELFTEST_ASSERT_HAS_MQTT_JSON_SENT(topic, false);
+	SELFTEST_ASSERT_JSON_VALUE_STRING(NULL, "name", "Natural wind profile");
+	snprintf(topic, sizeof(topic), "homeassistant/number/%s_number_0_t/config", name);
+	SELFTEST_ASSERT_HAS_MQTT_JSON_SENT(topic, false);
+	SELFTEST_ASSERT_JSON_VALUE_STRING(NULL, "cmd_tpl", "12 2 {{value|int}}");
+	snprintf(topic, sizeof(topic), "homeassistant/sensor/%s_sensor_0_r/config", name);
+	SELFTEST_ASSERT_HAS_MQTT_JSON_SENT(topic, false);
+	SELFTEST_ASSERT_JSON_VALUE_STRING(NULL, "unit_of_meas", "min");
+	CMD_ExecuteCommand("stopDriver MIoT", 0);
+}
+
 void Test_MIoT(void) {
 	int i;
 	MIoT_TestCallbacks();
@@ -430,6 +522,7 @@ void Test_MIoT(void) {
 	SELFTEST_ASSERT_HAS_UART_EMPTY();
 	MIoT_TestNetworkReset();
 	MIoT_TestFanDiscovery();
+	MIoT_TestFanEnums();
 }
 #endif
 #endif

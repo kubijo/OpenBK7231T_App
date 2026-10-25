@@ -62,6 +62,14 @@ static bool MIoT_Int(const char *text, int *value);
 
 #if ENABLE_HA_DISCOVERY && ENABLE_MQTT
 static int fanProperties[4];
+typedef struct {
+	int property, count;
+	char labels[4][24];
+} miotFanEnum_t;
+static miotFanEnum_t fanMode, fanProfile;
+static bool MIoT_FanConfigFits(const int *indices, miotFanEnum_t *mode);
+static int fanTimerProperties[2];
+static bool fanTimer;
 static bool fanEnabled, fanDirty, fanMqttReady;
 static char fanDiscoveryTopic[64] = "homeassistant";
 
@@ -72,12 +80,19 @@ static void MIoT_QueueFanDiscovery(const char *topic, const char *channel, const
 
 static void MIoT_ClearFan(void) {
 	int i;
-	for (i = 0; i < 2; i++) {
-		HassDeviceInfo *info = hass_init_device_info(i ? HASS_SELECT : HASS_FAN, 0, NULL, NULL, 0, i ? "fan" : NULL);
+	const ENTITY_TYPE types[] = {HASS_FAN, HASS_SELECT, HASS_SELECT, HASS_PERCENT, CUSTOM_SENSOR};
+	const char *titles[] = {NULL, "fan", "pr", "t", "r"};
+	for (i = 0; i < 5; i++) {
+		HassDeviceInfo *info;
+		if ((i == 2 && !fanProfile.count) || (i >= 3 && !fanTimer))
+			continue;
+		info = hass_init_device_info(types[i], 0, NULL, NULL, 0, titles[i]);
 		if (!info)
 			continue;
-		if (i)
+		if (i == 1 || i == 2)
 			snprintf(info->channel, sizeof(info->channel), "select/%s/config", info->unique_id);
+		else if (i == 4)
+			snprintf(info->channel, sizeof(info->channel), "sensor/%s/config", info->unique_id);
 		MIoT_QueueFanDiscovery(fanDiscoveryTopic, info->channel, "");
 		hass_free_device_info(info);
 	}
@@ -85,7 +100,7 @@ static void MIoT_ClearFan(void) {
 }
 
 static void MIoT_PublishFanState(void) {
-	char state[128];
+	char state[256], extra[64];
 	int i;
 	if (!fanEnabled || !fanDirty || !MQTT_IsReady())
 		return;
@@ -95,6 +110,22 @@ static void MIoT_PublishFanState(void) {
 	snprintf(state, sizeof(state), "{\"power\":%s,\"speed\":%i,\"oscillation\":%s,\"angle\":%i}",
 			 properties[fanProperties[0]].value ? "true" : "false", properties[fanProperties[1]].value,
 			 properties[fanProperties[2]].value ? "true" : "false", properties[fanProperties[3]].value);
+	if ((fanMode.count && !properties[fanMode.property].known) || (fanProfile.count && !properties[fanProfile.property].known))
+		return;
+	if (fanMode.count) {
+		snprintf(extra, sizeof(extra), ",\"mode\":%i}", properties[fanMode.property].value);
+		strcpy(state + strlen(state) - 1, extra);
+	}
+	if (fanProfile.count) {
+		snprintf(extra, sizeof(extra), ",\"profile\":%i}", properties[fanProfile.property].value);
+		strcpy(state + strlen(state) - 1, extra);
+	}
+	if (fanTimer) {
+		if (!properties[fanTimerProperties[0]].known || !properties[fanTimerProperties[1]].known)
+			return;
+		snprintf(extra, sizeof(extra), ",\"timer\":%i,\"remaining\":%i}", properties[fanTimerProperties[0]].value, properties[fanTimerProperties[1]].value);
+		strcpy(state + strlen(state) - 1, extra);
+	}
 	// Publish the current snapshot directly: reusable queue slots can reorder states.
 	if (MQTT_Publish(CFG_GetMQTTClientId(), "miot/fan/get", state, OBK_PUBLISH_FLAG_RETAIN) == OBK_PUBLISH_OK)
 		fanDirty = false;
@@ -124,11 +155,17 @@ static commandResult_t MIoT_FanCommand(char **tokens, int count) {
 		for (j = 0; j < i; j++)
 			if (indices[i] == indices[j])
 				return CMD_RES_BAD_ARGUMENT;
+		if ((fanMode.count && indices[i] == fanMode.property) || (fanProfile.count && indices[i] == fanProfile.property))
+			return CMD_RES_BAD_ARGUMENT;
+		if (fanTimer && (indices[i] == fanTimerProperties[0] || indices[i] == fanTimerProperties[1]))
+			return CMD_RES_BAD_ARGUMENT;
 	}
 	speed = &properties[indices[1]];
 	angle = &properties[indices[3]];
 	options = ((int64_t)angle->max - angle->min) / angle->step + 1;
 	if (!properties[indices[0]].boolean || properties[indices[0]].step != 1 || !properties[indices[2]].boolean || properties[indices[2]].step != 1 || speed->boolean || speed->min < 1 || speed->max <= speed->min || speed->step != 1 || angle->boolean || options < 2 || options > 16)
+		return CMD_RES_BAD_ARGUMENT;
+	if (!MIoT_FanConfigFits(indices, &fanMode))
 		return CMD_RES_BAD_ARGUMENT;
 	if (!MQTT_CancelQueuedPublish(CFG_GetMQTTClientId(), "miot/fan/get"))
 		return CMD_RES_ERROR;
@@ -136,6 +173,109 @@ static commandResult_t MIoT_FanCommand(char **tokens, int count) {
 	fanEnabled = fanDirty = true;
 	CMD_ExecuteCommand("scheduleHADiscovery 1", 0);
 	return CMD_RES_OK;
+}
+
+static commandResult_t MIoT_FanEnumCommand(char **tokens, int count) {
+	miotFanEnum_t candidate = {0}, *target, *other;
+	miotProperty_t *p;
+	int i, j, channel;
+	if (!fanEnabled || count < 3 || count > 6 || !MIoT_Int(tokens[1], &channel))
+		return CMD_RES_BAD_ARGUMENT;
+	if (!strcmp(tokens[0], "preset")) {
+		target = &fanMode;
+		other = &fanProfile;
+	} else if (!strcmp(tokens[0], "profile")) {
+		target = &fanProfile;
+		other = &fanMode;
+	} else
+		return CMD_RES_BAD_ARGUMENT;
+	candidate.property = -1;
+	for (i = 0; i < propertyCount; i++)
+		if (properties[i].channel == channel)
+			candidate.property = i;
+	if (candidate.property < 0)
+		return CMD_RES_BAD_ARGUMENT;
+	p = &properties[candidate.property];
+	candidate.count = count - 2;
+	if (!p->writable || p->boolean || p->step != 1 || (int64_t)p->max - p->min + 1 != candidate.count || (other->count && other->property == candidate.property))
+		return CMD_RES_BAD_ARGUMENT;
+	if (fanTimer && (candidate.property == fanTimerProperties[0] || candidate.property == fanTimerProperties[1]))
+		return CMD_RES_BAD_ARGUMENT;
+	for (i = 0; i < 4; i++)
+		if (fanProperties[i] == candidate.property)
+			return CMD_RES_BAD_ARGUMENT;
+	for (i = 0; i < candidate.count; i++) {
+		if (!*tokens[i + 2] || strlen(tokens[i + 2]) >= sizeof(candidate.labels[i]))
+			return CMD_RES_BAD_ARGUMENT;
+		if (tokens[i + 2][0] == '_' || tokens[i + 2][strlen(tokens[i + 2]) - 1] == '_')
+			return CMD_RES_BAD_ARGUMENT;
+		for (j = 0; tokens[i + 2][j]; j++) {
+			char c = tokens[i + 2][j];
+			if (!isalnum((unsigned char)c) && c != '_')
+				return CMD_RES_BAD_ARGUMENT;
+			candidate.labels[i][j] = c == '_' ? ' ' : c;
+		}
+		for (j = 0; j < i; j++)
+			if (!strcmp(candidate.labels[i], candidate.labels[j]))
+				return CMD_RES_BAD_ARGUMENT;
+	}
+	if (target == &fanMode && !MIoT_FanConfigFits(fanProperties, &candidate))
+		return CMD_RES_BAD_ARGUMENT;
+	*target = candidate;
+	fanDirty = true;
+	CMD_ExecuteCommand("scheduleHADiscovery 1", 0);
+	return CMD_RES_OK;
+}
+
+static commandResult_t MIoT_FanTimerCommand(char **tokens, int count) {
+	int indices[2], i, j, channel;
+	if (!fanEnabled || count != 2)
+		return CMD_RES_BAD_ARGUMENT;
+	for (i = 0; i < 2; i++) {
+		if (!MIoT_Int(tokens[i], &channel))
+			return CMD_RES_BAD_ARGUMENT;
+		indices[i] = -1;
+		for (j = 0; j < propertyCount; j++)
+			if (properties[j].channel == channel)
+				indices[i] = j;
+		if (indices[i] < 0 || properties[indices[i]].boolean || properties[indices[i]].min != 0 || properties[indices[i]].max < 1 || properties[indices[i]].step != 1 || properties[indices[i]].writable != (i == 0))
+			return CMD_RES_BAD_ARGUMENT;
+		for (j = 0; j < 4; j++)
+			if (indices[i] == fanProperties[j])
+				return CMD_RES_BAD_ARGUMENT;
+		if ((fanMode.count && indices[i] == fanMode.property) || (fanProfile.count && indices[i] == fanProfile.property))
+			return CMD_RES_BAD_ARGUMENT;
+	}
+	if (indices[0] == indices[1] || properties[indices[0]].max != properties[indices[1]].max)
+		return CMD_RES_BAD_ARGUMENT;
+	memcpy(fanTimerProperties, indices, sizeof(indices));
+	fanTimer = fanDirty = true;
+	CMD_ExecuteCommand("scheduleHADiscovery 1", 0);
+	return CMD_RES_OK;
+}
+
+static void MIoT_FanEnumDiscovery(HassDeviceInfo *info, miotFanEnum_t *binding, bool preset) {
+	miotProperty_t *p = &properties[binding->property];
+	cJSON *options;
+	char text[256], values[112] = "[";
+	int i;
+	options = cJSON_AddArrayToObject(info->root, preset ? "pr_modes" : "ops");
+	for (i = 0; i < binding->count; i++) {
+		cJSON_AddItemToArray(options, cJSON_CreateString(binding->labels[i]));
+		snprintf(values + strlen(values), sizeof(values) - strlen(values), "%s'%s'", i ? "," : "", binding->labels[i]);
+	}
+	strcat(values, "]");
+	snprintf(text, sizeof(text), "%i %i {{ %s.index(value) + (%i) }}", p->siid, p->piid, values, p->min);
+	cJSON_AddStringToObject(info->root, preset ? "pr_mode_cmd_tpl" : "cmd_tpl", text);
+	snprintf(text, sizeof(text), "{{ %s[value_json.%s - (%i)] }}", values, preset ? "mode" : "profile", p->min);
+	cJSON_AddStringToObject(info->root, preset ? "pr_mode_val_tpl" : "val_tpl", text);
+}
+
+static void MIoT_SendFanDiscovery(const char *topic, HassDeviceInfo *info) {
+	const char *json = hass_build_discovery_json(info);
+	// A serialization failure must not delete a previously retained entity.
+	if (json && *json)
+		MIoT_QueueFanDiscovery(topic, info->channel, json);
 }
 #endif
 
@@ -465,24 +605,18 @@ void MIoT_RunFrame(void) {
 	}
 }
 
-void MIoT_OnHassDiscovery(const char *topic) {
 #if ENABLE_HA_DISCOVERY && ENABLE_MQTT
+static HassDeviceInfo *MIoT_BuildFanConfig(const int *indices, miotFanEnum_t *mode) {
 	HassDeviceInfo *info;
-	miotProperty_t *power, *speed, *oscillation, *angle;
+	miotProperty_t *power, *speed, *oscillation;
 	char command[CGF_MQTT_CLIENT_ID_SIZE + 24], text[256];
-	int i, optionCount;
-	cJSON *options;
-	if (!fanEnabled || !MIoT_IsCurrent(sessionGeneration) || strlen(topic) >= sizeof(fanDiscoveryTopic))
-		return;
-	strcpy(fanDiscoveryTopic, topic);
-	power = &properties[fanProperties[0]];
-	speed = &properties[fanProperties[1]];
-	oscillation = &properties[fanProperties[2]];
-	angle = &properties[fanProperties[3]];
+	power = &properties[indices[0]];
+	speed = &properties[indices[1]];
+	oscillation = &properties[indices[2]];
 	snprintf(command, sizeof(command), "cmnd/%s/miotSet", CFG_GetMQTTClientId());
 	info = hass_init_device_info(HASS_FAN, 0, "true", "false", 0, NULL);
 	if (!info)
-		return;
+		return NULL;
 	cJSON_ReplaceItemInObject(info->root, "name", cJSON_CreateString("Fan"));
 	cJSON_AddStringToObject(info->root, "cmd_t", command);
 	snprintf(text, sizeof(text), "%i %i {{value}}", power->siid, power->piid);
@@ -504,8 +638,42 @@ void MIoT_OnHassDiscovery(const char *topic) {
 	cJSON_AddStringToObject(info->root, "osc_val_tpl", "{{ 'true' if value_json.oscillation else 'false' }}");
 	cJSON_AddStringToObject(info->root, "pl_osc_on", "true");
 	cJSON_AddStringToObject(info->root, "pl_osc_off", "false");
+	if (mode->count) {
+		cJSON_AddStringToObject(info->root, "pr_mode_cmd_t", command);
+		cJSON_AddStringToObject(info->root, "pr_mode_stat_t", "~/miot/fan/get");
+		MIoT_FanEnumDiscovery(info, mode, true);
+	}
 	cJSON_AddBoolToObject(info->root, "ret", false);
-	MIoT_QueueFanDiscovery(topic, info->channel, hass_build_discovery_json(info));
+	return info;
+}
+
+static bool MIoT_FanConfigFits(const int *indices, miotFanEnum_t *mode) {
+	HassDeviceInfo *info = MIoT_BuildFanConfig(indices, mode);
+	bool fits;
+	if (!info)
+		return false;
+	fits = cJSON_PrintPreallocated(info->root, info->json, HASS_JSON_SIZE, 0);
+	hass_free_device_info(info);
+	return fits;
+}
+#endif
+
+void MIoT_OnHassDiscovery(const char *topic) {
+#if ENABLE_HA_DISCOVERY && ENABLE_MQTT
+	HassDeviceInfo *info;
+	miotProperty_t *angle;
+	char command[CGF_MQTT_CLIENT_ID_SIZE + 24], text[256];
+	int i, optionCount;
+	cJSON *options;
+	if (!fanEnabled || !MIoT_IsCurrent(sessionGeneration) || strlen(topic) >= sizeof(fanDiscoveryTopic))
+		return;
+	strcpy(fanDiscoveryTopic, topic);
+	angle = &properties[fanProperties[3]];
+	snprintf(command, sizeof(command), "cmnd/%s/miotSet", CFG_GetMQTTClientId());
+	info = MIoT_BuildFanConfig(fanProperties, &fanMode);
+	if (!info)
+		return;
+	MIoT_SendFanDiscovery(topic, info);
 	hass_free_device_info(info);
 	info = hass_init_device_info(HASS_SELECT, 0, NULL, NULL, 0, "fan");
 	if (!info)
@@ -524,8 +692,49 @@ void MIoT_OnHassDiscovery(const char *topic) {
 		snprintf(text, sizeof(text), "%i", (int)((int64_t)angle->min + (int64_t)i * angle->step));
 		cJSON_AddItemToArray(options, cJSON_CreateString(text));
 	}
-	MIoT_QueueFanDiscovery(topic, info->channel, hass_build_discovery_json(info));
+	MIoT_SendFanDiscovery(topic, info);
 	hass_free_device_info(info);
+	if (fanProfile.count) {
+		info = hass_init_device_info(HASS_SELECT, 0, NULL, NULL, 0, "pr");
+		if (!info)
+			return;
+		snprintf(info->channel, sizeof(info->channel), "select/%s/config", info->unique_id);
+		cJSON_ReplaceItemInObject(info->root, "name", cJSON_CreateString("Natural wind profile"));
+		cJSON_AddStringToObject(info->root, "cmd_t", command);
+		cJSON_AddStringToObject(info->root, "stat_t", "~/miot/fan/get");
+		cJSON_AddBoolToObject(info->root, "ret", false);
+		MIoT_FanEnumDiscovery(info, &fanProfile, false);
+		MIoT_SendFanDiscovery(topic, info);
+		hass_free_device_info(info);
+	}
+	if (fanTimer) {
+		for (i = 0; i < 2; i++) {
+			info = hass_init_device_info(i ? CUSTOM_SENSOR : HASS_PERCENT, 0, NULL, NULL, 0, i ? "r" : "t");
+			if (!info)
+				return;
+			if (i)
+				snprintf(info->channel, sizeof(info->channel), "sensor/%s/config", info->unique_id);
+			cJSON_ReplaceItemInObject(info->root, "name", cJSON_CreateString(i ? "Auto off remaining" : "Auto off timer"));
+			cJSON_AddStringToObject(info->root, "stat_t", "~/miot/fan/get");
+			cJSON_AddStringToObject(info->root, "val_tpl", i ? "{{ value_json.remaining }}" : "{{ value_json.timer }}");
+			cJSON_AddStringToObject(info->root, "unit_of_meas", "min");
+			cJSON_AddStringToObject(info->root, "ic", "mdi:timer-outline");
+			if (!i) {
+				miotProperty_t *duration = &properties[fanTimerProperties[0]];
+				cJSON_AddStringToObject(info->root, "cmd_t", command);
+				snprintf(text, sizeof(text), "%i %i {{value|int}}", duration->siid, duration->piid);
+				cJSON_AddStringToObject(info->root, "cmd_tpl", text);
+				cJSON_AddNumberToObject(info->root, "min", 0);
+				cJSON_AddNumberToObject(info->root, "max", duration->max);
+				cJSON_AddNumberToObject(info->root, "step", 1);
+				cJSON_AddStringToObject(info->root, "mode", "box");
+				cJSON_AddBoolToObject(info->root, "ret", false);
+			} else
+				cJSON_AddStringToObject(info->root, "dev_cla", "duration");
+			MIoT_SendFanDiscovery(topic, info);
+			hass_free_device_info(info);
+		}
+	}
 	fanDirty = true;
 #else
 	(void)topic;
@@ -586,12 +795,19 @@ static commandResult_t MIoT_Command(const void *context, const char *cmd, const 
 	strcpy(buffer, args);
 	count = MIoT_Tokenize(buffer, tokens, 9);
 #if ENABLE_HA_DISCOVERY && ENABLE_MQTT
-	if (!stricmp(cmd, "miotFan")) {
+	if (!stricmp(cmd, "miotFan") || !stricmp(cmd, "miotFanEnum") || !stricmp(cmd, "miotFanTimer")) {
 		commandResult_t result;
 		// Reject reentrant calls rather than racing discovery, state publication or stop.
 		if (!DRV_Mutex_Take(0))
 			return CMD_RES_ERROR;
-		result = MIoT_IsCurrent(sessionGeneration) ? MIoT_FanCommand(tokens, count) : CMD_RES_ERROR;
+		if (!MIoT_IsCurrent(sessionGeneration))
+			result = CMD_RES_ERROR;
+		else if (!stricmp(cmd, "miotFan"))
+			result = MIoT_FanCommand(tokens, count);
+		else if (!stricmp(cmd, "miotFanEnum"))
+			result = MIoT_FanEnumCommand(tokens, count);
+		else
+			result = MIoT_FanTimerCommand(tokens, count);
 		DRV_Mutex_Free();
 		return result;
 	}
@@ -657,6 +873,8 @@ void MIoT_Init(void) {
 	pollSeconds = 0;
 #if ENABLE_HA_DISCOVERY && ENABLE_MQTT
 	fanEnabled = fanDirty = fanMqttReady = false;
+	fanMode.count = fanProfile.count = 0;
+	fanTimer = false;
 	strcpy(fanDiscoveryTopic, "homeassistant");
 #endif
 	MIoT_ResetSession();
@@ -690,6 +908,14 @@ void MIoT_Init(void) {
 	//cmddetail:"descr":"Bind existing writable MIoT mappings to an MQTT fan and swing-angle select. Speed requires integer steps; angle permits 2 to 16 options. off removes discovery.",
 	//cmddetail:"fn":"MIoT_Command","file":"driver/drv_miot.c","requires":"MIoT","examples":"miotFan 1 2 3 4"}
 	CMD_RegisterCommand("miotFan", MIoT_Command, NULL);
+	//cmddetail:{"name":"miotFanEnum","args":"preset|profile Channel Label...",
+	//cmddetail:"descr":"Add up to four named integer options to the fan's preset mode or profile select. Use underscores for spaces; labels follow the mapped range in order. See docs/MIoT.md.",
+	//cmddetail:"fn":"MIoT_Command","file":"driver/drv_miot.c","requires":"MIoT","examples":"miotFanEnum preset 5 Direct Natural Sleep"}
+	CMD_RegisterCommand("miotFanEnum", MIoT_Command, NULL);
+	//cmddetail:{"name":"miotFanTimer","args":"DurationChannel RemainingChannel",
+	//cmddetail:"descr":"Add a minute-based auto-off number and remaining-time sensor to the fan. Duration must be writable, remaining read-only, with matching integer ranges from zero and unit steps. Zero cancels. See docs/MIoT.md.",
+	//cmddetail:"fn":"MIoT_Command","file":"driver/drv_miot.c","requires":"MIoT","examples":"miotFanTimer 7 8"}
+	CMD_RegisterCommand("miotFanTimer", MIoT_Command, NULL);
 #endif
 	// clang-format on
 }

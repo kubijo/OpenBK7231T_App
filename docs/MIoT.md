@@ -20,11 +20,11 @@ require bounds zero and one. Property identifiers and channels must be unique.
 Mappings are recreated by the startup script after reboot.
 
 The [Xiaomi tower fan p45 preset](autoexecs/Xiaomi-Smart-Tower-Fan-2-p45.bat)
-maps power, speed percentage, oscillation, and swing angle to channels 1–4 and
-enables Home Assistant discovery. Copy its contents into the device's LittleFS
-`autoexec.bat` after selecting the correct UART. This is OpenBeken's startup
-command format. The four controls have been tested against the stock MCU image;
-the board's UART assignment and physical behavior still require verification.
+maps the fan controls and enables Home Assistant discovery. Copy its contents
+into the device's LittleFS `autoexec.bat` after selecting the correct UART. This
+is OpenBeken's startup command format. The controls have been exercised through
+Home Assistant against the stock MCU image; the board's UART assignment and
+physical behavior still require verification.
 
 Use channel commands or `miotSet SIID PIID Value` to request a write. `miotSet`
 requires literal `true` or `false` for a boolean; channel writes use zero or one.
@@ -45,16 +45,46 @@ The binding creates a fan with power, percentage, and oscillation, plus a swing
 angle select on the same device. Power and oscillation must be boolean; speed
 must be an integer range starting at one or greater with a step of one. The
 angle mapping must provide between two and sixteen integer options. Invalid
-bindings leave the previous configuration unchanged. The transport remains
-generic: SIID/PIID values come from the selected mappings, not a device model.
+bindings, including those exceeding the discovery payload limit, leave the
+previous configuration unchanged. The transport remains generic: SIID/PIID
+values come from the selected mappings, not a device model.
 
 Discovery uses the normal OpenBeken device identity, discovery prefix, and MQTT
 availability topic. Commands use `miotSet` without MQTT retention. Setting fan
 percentage to zero turns power off; turning on with a percentage sends power
-before speed. Additional modes, timers, and actions are not advertised.
+before speed. Optional enum and timer bindings extend the same device:
+
+```text
+miotFanEnum preset ModeChannel Label...
+miotFanEnum profile ProfileChannel Label...
+miotFanTimer DurationChannel RemainingChannel
+```
+
+Enum bindings accept up to four distinct labels, ordered from the mapped integer
+minimum to maximum with unit steps. Use underscores for spaces in labels. Presets
+appear on the fan entity, alongside speed and oscillation; a profile is an associated
+select. Each binding must use distinct mappings. The p45 preset provides Direct,
+Natural, and Sleep modes and four natural-wind profiles. The profile mapping also
+represents stepped speed in Direct mode; use it with the appropriate operating mode.
+
+Timer bindings require matching integer ranges starting at zero, with unit steps.
+Duration is writable and remaining time is read-only, both in minutes. Setting the
+timer requests the MCU's countdown; zero cancels it. The p45 preset writes duration
+directly. Its separate delay-enable property is unnecessary and would overwrite
+the requested duration with a one-hour preset. Writes while powered off may be
+acknowledged without changing the MCU; readback remains authoritative.
+
+The stock p45 MCU fixture verifies modes, natural profiles, and timer behavior.
+Native driver selftests pass normally and with AddressSanitizer. The production
+BL602 core-control bridge regression also passes. Home Assistant integration
+verifies the extended controls, timer expiry/cancellation, and restart recovery.
+
+Home Assistant's standard fan popup exposes presets and oscillation. Angle, profile,
+timer, and remaining time use associated entities that can share one dashboard panel.
 
 The retained `<client-id>/miot/fan/get` JSON snapshot contains `power`, `speed`,
-`oscillation`, and `angle`. It is published only after all four mappings have
+`oscillation`, and `angle`, plus `mode`, `profile`, `timer`, and `remaining` for their
+optional bindings. It is published only after every bound mapping has
 MCU-confirmed values. A successful write result or a speculative local channel
 change does not establish confirmed state. Discovery and the latest confirmed
 snapshot are republished after MQTT reconnect. `miotFan off` or stopping the
