@@ -3,6 +3,7 @@
 #include "../cmnds/cmd_public.h"
 #include "../hal/hal_wifi.h"
 #include "../logging/logging.h"
+#include "../mqtt/new_mqtt.h"
 #include "../new_cfg.h"
 #include "../new_common.h"
 #include "../new_pins.h"
@@ -53,6 +54,7 @@ static int uartPort;
 static unsigned int sessionGeneration;
 static bool running, dropping;
 static bool allowNetworkReset, networkResetRequested;
+static const char *networkState;
 static int applyingChannel = -1;
 static int applyingValue;
 static char line[MIOT_LINE + 1];
@@ -338,12 +340,36 @@ static void MIoT_ReadAll(void) {
 		properties[i].read = true;
 }
 
+static const char *MIoT_NetworkState(void) {
+	if (networkResetRequested)
+		return "unprov";
+	// The shared connected flag can also be set by an AP event.
+	if (Main_IsOpenAccessPointMode())
+		return "uap";
+	if (Main_IsConnectedToWiFi()) {
+#if ENABLE_MQTT
+		// This is the MCU's notification-enabled state, also for a local broker.
+		if (MQTT_IsReady())
+			return "cloud";
+#endif
+		return "local";
+	}
+	if (*CFG_GetWiFiSSID()
+#if ALLOW_SSID2
+		|| *CFG_GetWiFiSSID2()
+#endif
+	)
+		return "offline";
+	return "unprov";
+}
+
 static void MIoT_ResetSession(void) {
 	int i;
 #if ENABLE_HA_DISCOVERY && ENABLE_MQTT
 	fanPublishPending = false;
 #endif
 	queueHead = queueCount = 0;
+	networkState = NULL;
 	pending = MIOT_IDLE;
 	readbackProperty = -1;
 	readCursor = 0;
@@ -421,6 +447,7 @@ static void MIoT_RequestRead(int index) {
 // urgent; background reads rotate and share polls with queued writes.
 static void MIoT_Poll(void) {
 	char reply[96];
+	const char *state;
 	int i, offset, index, value;
 	miotProperty_t *p;
 	MIoT_FinishRequest();
@@ -428,6 +455,13 @@ static void MIoT_Poll(void) {
 		index = readbackProperty;
 		readbackProperty = -1;
 		MIoT_RequestRead(index);
+		return;
+	}
+	state = MIoT_NetworkState();
+	if (!networkState || strcmp(networkState, state)) {
+		networkState = state;
+		snprintf(reply, sizeof(reply), "down MIIO_net_change %s", state);
+		MIoT_Send(reply);
 		return;
 	}
 	if (!queueCount || !preferWrite) {
@@ -532,7 +566,8 @@ static void MIoT_Process(void) {
 		MIoT_FinishRequest();
 		MIoT_Send(valid ? "ok" : "error");
 	} else if (!strcmp(tokens[0], "net") && count == 1) {
-		MIoT_Send(Main_IsConnectedToWiFi() ? "local" : "offline");
+		networkState = MIoT_NetworkState();
+		MIoT_Send(networkState);
 	} else if (!strcmp(tokens[0], "restore") && count == 1 && allowNetworkReset) {
 		MIoT_Send("ok");
 		if (!MIoT_IsCurrent(generation))

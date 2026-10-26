@@ -4,11 +4,17 @@
 #include "../driver/drv_miot.h"
 #include "../driver/drv_public.h"
 #include "../driver/drv_uart.h"
+#include "../hal/hal_wifi.h"
 #include "../mqtt/new_mqtt.h"
 #include "../quicktick.h"
 #include "selftest_local.h"
 
 #if ENABLE_DRIVER_MIOT
+void Main_ConnectToWiFiNow(void);
+void Main_OnWiFiStatusChange(int code);
+void SIM_ClearAndPrepareForMQTTTesting(const char *clientName, const char *groupName);
+extern int g_bDoingUnitTestsNow;
+
 static void MIoT_TestReceive(const char *text) {
 	while (*text)
 		UART_AppendByteToReceiveRingBuffer((unsigned char)*text++);
@@ -28,13 +34,16 @@ static void MIoT_TestExpect(const char *text) {
 
 static void MIoT_TestSetup(void) {
 	SIM_ClearOBK(0);
+	CFG_SetWiFiSSID("miot-test");
+	Main_ConnectToWiFiNow();
+	Main_OnWiFiStatusChange(WIFI_STA_DISCONNECTED);
 	SIM_UART_InitReceiveRingBuffer(8192);
 	SELFTEST_ASSERT(CMD_ExecuteCommand("startDriver MIoT", 0) == CMD_RES_OK);
 	SELFTEST_ASSERT(CMD_ExecuteCommand("MIOTMAP 2 1 1 bool 0 1 1", 0) == CMD_RES_OK);
 	SELFTEST_ASSERT(CMD_ExecuteCommand("miotMap 2 5 2 int 1 100 1", 0) == CMD_RES_OK);
 	SELFTEST_ASSERT(CMD_ExecuteCommand("miotMap 2 2 3 int 0 255 0", 0) == CMD_RES_OK);
-	MIoT_TestReceive("model xiaomi.fan.p45\r");
-	MIoT_TestExpect("ok\r");
+	MIoT_TestReceive("model xiaomi.fan.p45\rnet\r");
+	MIoT_TestExpect("ok\roffline\r");
 	MIoT_TestReceive("get_down\r");
 	MIoT_TestExpect("down get_properties 2 1\r");
 	MIoT_TestReceive("result 2 1 0 false\rget_down\r");
@@ -82,6 +91,8 @@ static void MIoT_TestCallbacks(void) {
 	SELFTEST_ASSERT_HAS_UART_EMPTY();
 	SELFTEST_ASSERT_CHANNEL(4, 0);
 	MIoT_TestReceive("get_down\r");
+	MIoT_TestExpect("down MIIO_net_change offline\r");
+	MIoT_TestReceive("get_down\r");
 	MIoT_TestExpect("down get_properties 2 5\r");
 }
 
@@ -91,12 +102,15 @@ static void MIoT_TestSustainedPolling(void) {
 	char text[128];
 	size_t length;
 	SIM_ClearOBK(0);
+	CFG_SetWiFiSSID("miot-test");
+	Main_ConnectToWiFiNow();
+	Main_OnWiFiStatusChange(WIFI_STA_DISCONNECTED);
 	SIM_UART_InitReceiveRingBuffer(8192);
 	CMD_ExecuteCommand("startDriver MIoT", 0);
 	for (i = 1; i <= 16; i++)
 		SELFTEST_ASSERT(CMD_ExecuteCommand(va("miotMap 2 %i %i int 0 100 1", i, i), 0) == CMD_RES_OK);
-	MIoT_TestReceive("model test\r");
-	MIoT_TestExpect("ok\r");
+	MIoT_TestReceive("model test\rnet\r");
+	MIoT_TestExpect("ok\roffline\r");
 	SELFTEST_ASSERT(CMD_ExecuteCommand("miotSet 2 1 37", 0) == CMD_RES_OK);
 	for (i = 0; i < 40; i++) {
 		g_timeMs += 1000;
@@ -184,8 +198,8 @@ static void MIoT_TestNetworkReset(void) {
 	MIoT_TestRetainedConfig(&before);
 	// No queued or new control write may replay while a network reset is pending.
 	SELFTEST_ASSERT(CMD_ExecuteCommand("miotSet 2 5 37", 0) == CMD_RES_ERROR);
-	MIoT_TestReceive("model xiaomi.fan.p45\rget_down\r");
-	MIoT_TestExpect("ok\rdown get_properties 2 1\r");
+	MIoT_TestReceive("model xiaomi.fan.p45\rnet\rget_down\r");
+	MIoT_TestExpect("ok\runprov\rdown get_properties 2 1\r");
 	// Duplicate requests acknowledge without clearing edits or postponing reboot.
 	CFG_SetWiFiSSID("edited-after-request");
 	MIoT_TestReceive("restore\rrestore\r");
@@ -324,6 +338,8 @@ static void MIoT_TestFanPublishing(void) {
 	const char *confirmed = "{\"power\":false,\"speed\":37,\"oscillation\":false,\"angle\":90}";
 	mqtt_client_t *client;
 	SIM_ClearAndPrepareForMQTTTesting("miot-test", "bekens");
+	CFG_SetWiFiSSID("miot-test");
+	Main_ConnectToWiFiNow();
 	SIM_UART_InitReceiveRingBuffer(8192);
 	CMD_ExecuteCommand("startDriver MIoT", 0);
 	CMD_ExecuteCommand("miotMap 2 1 1 bool 0 1 1", 0);
@@ -331,6 +347,8 @@ static void MIoT_TestFanPublishing(void) {
 	CMD_ExecuteCommand("miotMap 2 6 3 bool 0 1 1", 0);
 	CMD_ExecuteCommand("miotMap 2 7 4 int 30 150 1 30", 0);
 	CMD_ExecuteCommand("miotFan 1 2 3 4", 0);
+	MIoT_TestReceive("net\r");
+	MIoT_TestExpect("cloud\r");
 	MIoT_TestReceive("get_down\rresult 2 1 0 false\rget_down\rresult 2 5 0 1\rget_down\rresult 2 6 0 false\rget_down\rresult 2 7 0 90\r");
 	MIoT_TestExpect("down get_properties 2 1\rok\rdown get_properties 2 5\rok\rdown get_properties 2 6\rok\rdown get_properties 2 7\rok\r");
 	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR(topic, initial, true);
@@ -476,6 +494,116 @@ static void MIoT_TestFanEnums(void) {
 	CMD_ExecuteCommand("stopDriver MIoT", 0);
 }
 
+static void MIoT_TestNetworkState(void) {
+	mqtt_client_t *client;
+	int i, testing;
+	MIoT_TestSetup();
+	CMD_ExecuteCommand("miotMap 2 6 4 bool 0 1 1", 0);
+	CMD_ExecuteCommand("miotMap 2 7 5 int 30 150 1 30", 0);
+	CMD_ExecuteCommand("miotFan 1 2 4 5", 0);
+	CFG_SetMQTTClientId("miot-network");
+	Main_OnWiFiStatusChange(WIFI_STA_CONNECTED);
+	MQTT_init();
+	for (i = 0; i < 20; i++)
+		MQTT_RunEverySecondUpdate();
+	SELFTEST_ASSERT(MQTT_IsReady());
+	client = mqtt_client;
+
+	// Connection changes wait for a poll; the MCU's entry burst is not a result.
+	DRV_RunQuickTick();
+	SELFTEST_ASSERT_HAS_UART_EMPTY();
+	MIoT_TestReceive("get_down\r");
+	MIoT_TestExpect("down MIIO_net_change cloud\r");
+	MIoT_TestReceive("properties_changed 1 5 \"\"\rproperties_changed 13 3 \"a_b_c_d_e_f_g_h\"\rproperties_changed 2 1 true 2 5 58 2 6 false 2 7 90\r");
+	MIoT_TestExpect("ok\rok\rok\r");
+	SELFTEST_ASSERT_CHANNEL(1, 1);
+	SELFTEST_ASSERT_CHANNEL(2, 58);
+	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR("miot-network/miot/fan/get", "{\"power\":true,\"speed\":58,\"oscillation\":false,\"angle\":90}", true);
+	MIoT_TestReceive("get_down\rresult 2 6 0 false\rget_down\rresult 2 7 0 90\rget_down\r");
+	MIoT_TestExpect("down get_properties 2 6\rok\rdown get_properties 2 7\rok\rdown none\r");
+
+	// Coalesce changes before a poll and avoid repeating an unchanged announcement.
+	Main_OnWiFiStatusChange(WIFI_STA_DISCONNECTED);
+	Main_OnWiFiStatusChange(WIFI_STA_CONNECTED);
+	MIoT_TestReceive("get_down\r");
+	MIoT_TestExpect("down none\r");
+	// The fake connect leaves an allocated, disconnected client. Briefly use its
+	// real status, without running network ticks or opening a socket.
+	testing = g_bDoingUnitTestsNow;
+	g_bDoingUnitTestsNow = 0;
+	MIoT_TestReceive("net\rget_down\r");
+	g_bDoingUnitTestsNow = testing;
+	MIoT_TestExpect("local\rdown none\r");
+	SELFTEST_ASSERT(mqtt_client == client);
+	MIoT_TestReceive("get_down\r");
+	MIoT_TestExpect("down MIIO_net_change cloud\r");
+	mqtt_client = NULL;
+	MIoT_TestReceive("get_down\rget_down\r");
+	MIoT_TestExpect("down MIIO_net_change local\rdown none\r");
+	mqtt_client = client;
+	// A direct net reply also synchronizes the state, without a duplicate command.
+	MIoT_TestReceive("net\rget_down\r");
+	MIoT_TestExpect("cloud\rdown none\r");
+
+	// A broker loss cannot displace the independent read after a write.
+	CMD_ExecuteCommand("miotSet 2 5 37", 0);
+	MIoT_TestReceive("get_down\rresult 2 5 0\r");
+	MIoT_TestExpect("down set_properties 2 5 37\rok\r");
+	mqtt_client = NULL;
+	MIoT_TestReceive("get_down\rresult 2 5 0 58\rget_down\r");
+	MIoT_TestExpect("down get_properties 2 5\rok\rdown MIIO_net_change local\r");
+	SELFTEST_ASSERT_CHANNEL(2, 58);
+	CMD_ExecuteCommand("miotSet 2 1 false", 0);
+	mqtt_client = client;
+	MIoT_TestReceive("get_down\r");
+	MIoT_TestExpect("down MIIO_net_change cloud\r");
+	MIoT_TestReceive("properties_changed 1 5 \"\"\rproperties_changed 2 5 75\rget_down\r");
+	MIoT_TestExpect("ok\rok\rdown set_properties 2 1 false\r");
+	SELFTEST_ASSERT_CHANNEL(2, 75);
+	MIoT_TestReceive("result 2 1 0\rget_down\rresult 2 1 0 false\r");
+	MIoT_TestExpect("ok\rdown get_properties 2 1\rok\r");
+
+	// A stale broker connection cannot mask station loss. Either SSID provisions it.
+	Main_OnWiFiStatusChange(WIFI_STA_DISCONNECTED);
+	MIoT_TestReceive("get_down\rnet\r");
+	MIoT_TestExpect("down MIIO_net_change offline\roffline\r");
+	CFG_SetWiFiSSID("");
+	CFG_SetWiFiSSID2("miot-alternate");
+	MIoT_TestReceive("net\r");
+	MIoT_TestExpect("offline\r");
+	CFG_SetWiFiSSID2("");
+	MIoT_TestReceive("get_down\rnet\r");
+	MIoT_TestExpect("down MIIO_net_change unprov\runprov\r");
+	CFG_SetWiFiSSID("miot-test");
+	Main_OnWiFiStatusChange(WIFI_STA_CONNECTED);
+	MIoT_TestReceive("get_down\r");
+	MIoT_TestExpect("down MIIO_net_change cloud\r");
+
+	// MCU and driver restarts synchronize even if the MCU omits an initial net query.
+	MIoT_TestReceive("model test\rget_down\rget_down\r");
+	MIoT_TestExpect("ok\rdown MIIO_net_change cloud\rdown get_properties 2 1\r");
+	CMD_ExecuteCommand("stopDriver MIoT", 0);
+	CMD_ExecuteCommand("startDriver MIoT", 0);
+	MIoT_TestReceive("get_down\rget_down\r");
+	MIoT_TestExpect("down MIIO_net_change cloud\rdown none\r");
+
+	// AP mode wins even when the shared Wi-Fi flag and MQTT client look connected.
+	CMD_ExecuteCommand("OpenAP", 0);
+	for (i = 0; i < 5; i++)
+		Main_OnEverySecond();
+	SELFTEST_ASSERT(Main_IsOpenAccessPointMode());
+	Main_OnWiFiStatusChange(WIFI_AP_CONNECTED);
+	SELFTEST_ASSERT(MQTT_IsReady());
+	MIoT_TestReceive("get_down\rnet\r");
+	MIoT_TestExpect("down MIIO_net_change uap\ruap\r");
+	CMD_ExecuteCommand("miotAllowNetworkReset 1", 0);
+	MIoT_TestReceive("restore\rnet\r");
+	MIoT_TestExpect("ok\runprov\r");
+	RESET_ScheduleModuleReset(0);
+	CMD_ExecuteCommand("stopDriver MIoT", 0);
+	Main_ConnectToWiFiNow();
+}
+
 void Test_MIoT(void) {
 	int i;
 	MIoT_TestCallbacks();
@@ -570,8 +698,8 @@ void Test_MIoT(void) {
 		SELFTEST_ASSERT(CMD_ExecuteCommand("miotSet 2 5 37", 0) == CMD_RES_OK);
 	SELFTEST_ASSERT(CMD_ExecuteCommand("miotSet 2 5 100", 0) == CMD_RES_ERROR);
 	// MCU restart drops pre-reset writes and refreshes state.
-	MIoT_TestReceive("model xiaomi.fan.p45\rget_down\r");
-	MIoT_TestExpect("ok\rdown get_properties 2 1\r");
+	MIoT_TestReceive("model xiaomi.fan.p45\rnet\rget_down\r");
+	MIoT_TestExpect("ok\roffline\rdown get_properties 2 1\r");
 	MIoT_TestReceive("result 2 1 0 false\rget_down\rresult 2 5 0 1\rget_down\rresult 2 2 0 0\rget_down\r");
 	MIoT_TestExpect("ok\rdown get_properties 2 5\rok\rdown get_properties 2 2\rok\rdown none\r");
 	SELFTEST_ASSERT_CHANNEL(2, 1);
@@ -591,6 +719,7 @@ void Test_MIoT(void) {
 	MIoT_TestFanDiscovery();
 	MIoT_TestFanPublishing();
 	MIoT_TestFanEnums();
+	MIoT_TestNetworkState();
 }
 #endif
 #endif

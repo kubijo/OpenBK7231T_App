@@ -101,8 +101,16 @@ MCU state.
 
 ## State and recovery
 
-The driver answers startup identification, network, and polling requests. It
-reports Wi-Fi as local or offline, without claiming Xiaomi cloud connectivity.
+Network replies use `uap` while the setup AP is active, `cloud` with station Wi-Fi
+and MQTT connected, and `local` with Wi-Fi alone. Disconnected devices report
+`offline` if either saved SSID exists, otherwise `unprov`. AP mode takes precedence
+over the shared Wi-Fi connected flag. The MCU's `cloud` state enables unsolicited
+p45 button/timer notifications; the broker can be entirely local.
+
+Changes coalesce until the next command poll, which sends `MIIO_net_change` after
+any post-write readback. A direct `net` reply also synchronizes status; driver and
+MCU restarts force resynchronization.
+
 POSIX time requests use synchronized NTP when available; other time requests
 return zero. Firmware update, factory reset, string/float properties, and actions
 are not implemented. Events are acknowledged without a channel mapping.
@@ -146,8 +154,8 @@ Queued control writes are discarded, and new writes are rejected until reboot.
 Repeated `restore` requests are acknowledged without clearing settings again or
 postponing reboot. MCU identification and fresh reads can still resynchronize
 channel state. Full factory erase and firmware updates remain outside this
-handler. Setup-specific network-state replies and physical Wi-Fi indicator
-behavior require separate verification.
+handler. Until reboot, an accepted reset reports `unprov`. Physical Wi-Fi indicator
+behavior still requires board verification.
 
 ## Verification
 
