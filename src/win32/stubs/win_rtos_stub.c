@@ -31,7 +31,7 @@ int xSemaphoreTake(int semaphore, int blockTime) {
 	return 1;
 }
 int xSemaphoreCreateMutex() {
-	return 0;
+	return 1;
 }
 int xSemaphoreGive(int semaphore) {
 	return 0;

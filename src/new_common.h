@@ -441,6 +441,9 @@ typedef long portTickType;
 #define portTICK_PERIOD_MS 1
 #define configTICK_RATE_HZ 1
 typedef int SemaphoreHandle_t;
+int xSemaphoreCreateMutex(void);
+int xSemaphoreTake(int semaphore, int blockTime);
+int xSemaphoreGive(int semaphore);
 #define pdTRUE 1
 #define pdFALSE 0
 typedef int OSStatus;

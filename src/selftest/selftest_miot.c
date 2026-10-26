@@ -402,6 +402,91 @@ static void MIoT_TestFanPublishing(void) {
 	CMD_ExecuteCommand("stopDriver MIoT", 0);
 }
 
+static void MIoT_TestWrite(int piid, const char *value) {
+	MIoT_TestReceive("get_down\r");
+	MIoT_TestExpect(va("down set_properties 2 %i %s\r", piid, value));
+	MIoT_TestReceive(va("result 2 %i 0\rget_down\r", piid));
+	MIoT_TestExpect(va("ok\rdown get_properties 2 %i\r", piid));
+	MIoT_TestReceive(va("result 2 %i 0 %s\r", piid, value));
+	MIoT_TestExpect("ok\r");
+}
+
+static void MIoT_TestSpeedQueue(void) {
+	int i;
+	MIoT_TestSetup();
+	CMD_ExecuteCommand("miotMap 2 6 4 bool 0 1 1", 0);
+	CMD_ExecuteCommand("miotMap 2 7 5 int 30 150 1 30", 0);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotFan 1 2 4 5", 0) == CMD_RES_OK);
+	MIoT_TestReceive("get_down\rresult 2 6 0 false\rget_down\rresult 2 7 0 90\r");
+	MIoT_TestExpect("down get_properties 2 6\rok\rdown get_properties 2 7\rok\r");
+
+	// A slider burst consumes one slot and cannot publish unconfirmed state.
+	for (i = 1; i <= 100; i++)
+		SELFTEST_ASSERT(CMD_ExecuteCommand(va("miotSet 2 5 %i", i), 0) == CMD_RES_OK);
+	SELFTEST_ASSERT_CHANNEL(2, 1);
+	MIoT_TestWrite(5, "100");
+	SELFTEST_ASSERT_CHANNEL(2, 100);
+	MIoT_TestReceive("get_down\r");
+	MIoT_TestExpect("down none\r");
+
+	// Keep the in-flight write and its readback, then send only the latest speed.
+	CMD_ExecuteCommand("miotSet 2 5 13", 0);
+	MIoT_TestReceive("get_down\r");
+	MIoT_TestExpect("down set_properties 2 5 13\r");
+	CMD_ExecuteCommand("miotSet 2 5 88", 0);
+	CMD_ExecuteCommand("miotSet 2 5 21", 0);
+	CHANNEL_Set(2, 73, 0);
+	MIoT_TestReceive("result 2 5 0\rget_down\rresult 2 5 0 13\r");
+	MIoT_TestExpect("ok\rdown get_properties 2 5\rok\r");
+	SELFTEST_ASSERT_CHANNEL(2, 13);
+	MIoT_TestWrite(5, "73");
+	SELFTEST_ASSERT_CHANNEL(2, 73);
+
+	// A rejected replacement must not discard the valid pending speed.
+	CMD_ExecuteCommand("miotSet 2 5 42", 0);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotSet 2 5 101", 0) == CMD_RES_BAD_ARGUMENT);
+	CHANNEL_Set(2, 0, 0);
+	DRV_RunQuickTick();
+	SELFTEST_ASSERT_CHANNEL(2, 73);
+	MIoT_TestWrite(5, "42");
+
+	// Never combine speeds across a power command or combine power toggles.
+	CMD_ExecuteCommand("miotSet 2 5 13", 0);
+	CMD_ExecuteCommand("miotSet 2 1 false", 0);
+	CMD_ExecuteCommand("miotSet 2 5 21", 0);
+	CMD_ExecuteCommand("miotSet 2 5 88", 0);
+	CMD_ExecuteCommand("miotSet 2 1 true", 0);
+	CMD_ExecuteCommand("miotSet 2 5 42", 0);
+	CMD_ExecuteCommand("miotSet 2 5 73", 0);
+	MIoT_TestWrite(5, "13");
+	MIoT_TestWrite(1, "false");
+	MIoT_TestWrite(5, "88");
+	MIoT_TestWrite(1, "true");
+	MIoT_TestWrite(5, "73");
+
+	// A full, wrapped queue still accepts a tail replacement, not an extra write.
+	for (i = 0; i < 15; i++)
+		SELFTEST_ASSERT(CMD_ExecuteCommand(va("miotSet 2 1 %s", i % 2 ? "true" : "false"), 0) == CMD_RES_OK);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotSet 2 5 13", 0) == CMD_RES_OK);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotSet 2 5 88", 0) == CMD_RES_OK);
+	SELFTEST_ASSERT(CMD_ExecuteCommand("miotSet 2 1 true", 0) == CMD_RES_ERROR);
+	for (i = 0; i < 15; i++)
+		MIoT_TestWrite(1, i % 2 ? "true" : "false");
+	MIoT_TestWrite(5, "88");
+	MIoT_TestReceive("get_down\r");
+	MIoT_TestExpect("down none\r");
+
+	// Without the fan binding, generic property writes retain their FIFO behavior.
+	CMD_ExecuteCommand("miotFan off", 0);
+	CMD_ExecuteCommand("miotSet 2 5 13", 0);
+	CMD_ExecuteCommand("miotSet 2 5 73", 0);
+	MIoT_TestWrite(5, "13");
+	MIoT_TestWrite(5, "73");
+	MIoT_TestReceive("get_down\r");
+	MIoT_TestExpect("down none\r");
+	CMD_ExecuteCommand("stopDriver MIoT", 0);
+}
+
 static void MIoT_TestFanEnums(void) {
 	char name[64], topic[128];
 	SIM_ClearOBK(0);
@@ -718,6 +803,7 @@ void Test_MIoT(void) {
 	MIoT_TestNetworkReset();
 	MIoT_TestFanDiscovery();
 	MIoT_TestFanPublishing();
+	MIoT_TestSpeedQueue();
 	MIoT_TestFanEnums();
 	MIoT_TestNetworkState();
 }

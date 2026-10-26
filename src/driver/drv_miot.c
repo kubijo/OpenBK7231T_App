@@ -43,6 +43,12 @@ static miotProperty_t properties[MIOT_PROPERTIES];
 static int propertyCount;
 static miotWrite_t writes[MIOT_QUEUE];
 static int queueHead, queueCount;
+// HTTP commands and UART polling run in different tasks.
+// Never hold this lock across UART output, channel callbacks,
+// MQTT publication or script execution.
+static SemaphoreHandle_t queueMutex;
+static bool queueAccepting;
+static int queueSpeedProperty = -1;
 static miotPending_t pending;
 static int pendingProperty;
 static int readbackProperty = -1;
@@ -141,6 +147,9 @@ static commandResult_t MIoT_FanCommand(char **tokens, int count) {
 		if (fanEnabled)
 			MIoT_ClearFan();
 		fanEnabled = false;
+		xSemaphoreTake(queueMutex, (portTickType)-1);
+		queueSpeedProperty = -1;
+		xSemaphoreGive(queueMutex);
 		return CMD_RES_OK;
 	}
 	if (count != 4)
@@ -173,6 +182,9 @@ static commandResult_t MIoT_FanCommand(char **tokens, int count) {
 		return CMD_RES_ERROR;
 	memcpy(fanProperties, indices, sizeof(indices));
 	fanEnabled = fanDirty = true;
+	xSemaphoreTake(queueMutex, (portTickType)-1);
+	queueSpeedProperty = indices[1];
+	xSemaphoreGive(queueMutex);
 	CMD_ExecuteCommand("scheduleHADiscovery 1", 0);
 	return CMD_RES_OK;
 }
@@ -368,7 +380,11 @@ static void MIoT_ResetSession(void) {
 #if ENABLE_HA_DISCOVERY && ENABLE_MQTT
 	fanPublishPending = false;
 #endif
-	queueHead = queueCount = 0;
+	if (queueMutex) {
+		xSemaphoreTake(queueMutex, (portTickType)-1);
+		queueHead = queueCount = 0;
+		xSemaphoreGive(queueMutex);
+	}
 	networkState = NULL;
 	pending = MIOT_IDLE;
 	readbackProperty = -1;
@@ -415,16 +431,36 @@ static void MIoT_Apply(int index, int value) {
 	}
 }
 
-static bool MIoT_QueueWrite(int index, int value) {
-	miotProperty_t *p = &properties[index];
+static bool MIoT_QueueWrite(int index, int value, unsigned int generation) {
+	miotProperty_t *p;
 	int slot;
-	if (networkResetRequested || !p->writable || value < p->min || value > p->max || ((int64_t)value - p->min) % p->step || queueCount == MIOT_QUEUE)
-		return false;
+	bool accepted = false;
+	xSemaphoreTake(queueMutex, (portTickType)-1);
+	if (!queueAccepting || generation != sessionGeneration || index < 0 || index >= propertyCount)
+		goto done;
+	p = &properties[index];
+	if (!p->writable || value < p->min || value > p->max || ((int64_t)value - p->min) % p->step)
+		goto done;
+	// Replace only consecutive unsent fan speeds. Other writes preserve ordering,
+	// especially power changes; the in-flight request and its readback stay intact.
+	if (index == queueSpeedProperty && queueCount) {
+		slot = (queueHead + queueCount - 1) % MIOT_QUEUE;
+		if (writes[slot].property == index) {
+			writes[slot].value = value;
+			accepted = true;
+			goto done;
+		}
+	}
+	if (queueCount == MIOT_QUEUE)
+		goto done;
 	slot = (queueHead + queueCount) % MIOT_QUEUE;
 	writes[slot].property = index;
 	writes[slot].value = value;
 	queueCount++;
-	return true;
+	accepted = true;
+done:
+	xSemaphoreGive(queueMutex);
+	return accepted;
 }
 
 static void MIoT_FinishRequest(void) {
@@ -464,12 +500,14 @@ static void MIoT_Poll(void) {
 		MIoT_Send(reply);
 		return;
 	}
+	xSemaphoreTake(queueMutex, (portTickType)-1);
 	if (!queueCount || !preferWrite) {
 		for (offset = 0; offset < propertyCount; offset++) {
 			i = (readCursor + offset) % propertyCount;
 			if (properties[i].read) {
 				readCursor = (i + 1) % propertyCount;
 				preferWrite = true;
+				xSemaphoreGive(queueMutex);
 				MIoT_RequestRead(i);
 				return;
 			}
@@ -480,6 +518,7 @@ static void MIoT_Poll(void) {
 		value = writes[queueHead].value;
 		queueHead = (queueHead + 1) % MIOT_QUEUE;
 		queueCount--;
+		xSemaphoreGive(queueMutex);
 		preferWrite = false;
 		p = &properties[index];
 		pending = MIOT_WRITE;
@@ -492,6 +531,7 @@ static void MIoT_Poll(void) {
 		MIoT_Send(reply);
 		return;
 	}
+	xSemaphoreGive(queueMutex);
 	MIoT_Send("down none");
 }
 
@@ -573,7 +613,10 @@ static void MIoT_Process(void) {
 		if (!MIoT_IsCurrent(generation))
 			return;
 		if (!networkResetRequested) {
+			xSemaphoreTake(queueMutex, (portTickType)-1);
+			queueAccepting = false;
 			networkResetRequested = true;
+			xSemaphoreGive(queueMutex);
 			MIoT_ResetSession();
 			CFG_SetWiFiSSID("");
 			CFG_SetWiFiPass("");
@@ -808,7 +851,8 @@ void MIoT_RunEverySecond(void) {
 
 void MIoT_OnChannelChanged(int channel, int value) {
 	int i;
-	if (!MIoT_IsCurrent(sessionGeneration))
+	unsigned int generation = sessionGeneration;
+	if (!MIoT_IsCurrent(generation))
 		return;
 	// Consume only the direct echo. Scripts run later in CHANNEL_Set and may
 	// deliberately request a different value on this same channel.
@@ -819,7 +863,9 @@ void MIoT_OnChannelChanged(int channel, int value) {
 	for (i = 0; i < propertyCount; i++) {
 		if (properties[i].channel != channel)
 			continue;
-		if (!MIoT_QueueWrite(i, value)) {
+		if (!MIoT_QueueWrite(i, value, generation)) {
+			if (!MIoT_IsCurrent(generation))
+				return;
 			if (properties[i].known)
 				properties[i].reconcile = true;
 			else
@@ -833,9 +879,10 @@ void MIoT_OnChannelChanged(int channel, int value) {
 static commandResult_t MIoT_Command(const void *context, const char *cmd, const char *args, int flags) {
 	char buffer[192], *tokens[9];
 	int count, siid, piid, index, value;
+	unsigned int generation = sessionGeneration;
 	(void)context;
 	(void)flags;
-	if (!MIoT_IsCurrent(sessionGeneration) || strlen(args) >= sizeof(buffer))
+	if (!MIoT_IsCurrent(generation) || strlen(args) >= sizeof(buffer))
 		return CMD_RES_BAD_ARGUMENT;
 	strcpy(buffer, args);
 	count = MIoT_Tokenize(buffer, tokens, 9);
@@ -845,7 +892,7 @@ static commandResult_t MIoT_Command(const void *context, const char *cmd, const 
 		// Reject reentrant calls rather than racing discovery, state publication or stop.
 		if (!DRV_Mutex_Take(0))
 			return CMD_RES_ERROR;
-		if (!MIoT_IsCurrent(sessionGeneration))
+		if (!MIoT_IsCurrent(generation))
 			result = CMD_RES_ERROR;
 		else if (!stricmp(cmd, "miotFan"))
 			result = MIoT_FanCommand(tokens, count);
@@ -903,13 +950,24 @@ static commandResult_t MIoT_Command(const void *context, const char *cmd, const 
 	if (!stricmp(cmd, "miotSet") && count == 3 && MIoT_Value(index, tokens[2], &value)) {
 		if (((int64_t)value - properties[index].min) % properties[index].step)
 			return CMD_RES_BAD_ARGUMENT;
-		return MIoT_QueueWrite(index, value) ? CMD_RES_OK : CMD_RES_ERROR;
+		return MIoT_QueueWrite(index, value, generation) ? CMD_RES_OK : CMD_RES_ERROR;
 	}
 	return CMD_RES_BAD_ARGUMENT;
 }
 
 void MIoT_Init(void) {
+	// Keep the mutex across restarts: an older producer may still be waiting.
+	if (!queueMutex)
+		queueMutex = xSemaphoreCreateMutex();
+	if (!queueMutex) {
+		addLogAdv(LOG_ERROR, LOG_FEATURE_DRV, "MIoT queue mutex allocation failed");
+		return;
+	}
+	xSemaphoreTake(queueMutex, (portTickType)-1);
+	queueAccepting = false;
+	queueSpeedProperty = -1;
 	sessionGeneration++;
+	xSemaphoreGive(queueMutex);
 	propertyCount = 0;
 	lineLength = 0;
 	dropping = false;
@@ -926,7 +984,9 @@ void MIoT_Init(void) {
 	UART_InitReceiveRingBuffer(2048);
 	uartPort = UART_GetSelectedPortIndex();
 	uartGeneration = UART_InitUART(115200, 0, false);
-	running = true;
+	xSemaphoreTake(queueMutex, (portTickType)-1);
+	running = queueAccepting = true;
+	xSemaphoreGive(queueMutex);
 	// clang-format off
 	//cmddetail:{"name":"miotMap","args":"SIID PIID Channel bool|int Min Max Writable [Step]",
 	//cmddetail:"descr":"Map a MIoT property to an OpenBeken channel. Writable is 0 or 1; Step defaults to 1. Mappings are polled and refreshed after writes. See docs/MIoT.md.",
@@ -966,13 +1026,18 @@ void MIoT_Init(void) {
 }
 
 void MIoT_Stop(void) {
+	if (queueMutex)
+		xSemaphoreTake(queueMutex, (portTickType)-1);
+	queueAccepting = running = false;
+	queueSpeedProperty = -1;
+	sessionGeneration++;
+	if (queueMutex)
+		xSemaphoreGive(queueMutex);
 #if ENABLE_HA_DISCOVERY && ENABLE_MQTT
 	if (fanEnabled)
 		MIoT_ClearFan();
 	fanEnabled = false;
 #endif
-	running = false;
-	sessionGeneration++;
 	MIoT_ResetSession();
 	propertyCount = 0;
 	lineLength = 0;

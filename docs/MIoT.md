@@ -52,7 +52,15 @@ values come from the selected mappings, not a device model.
 Discovery uses the normal OpenBeken device identity, discovery prefix, and MQTT
 availability topic. Commands use `miotSet` without MQTT retention. Setting fan
 percentage to zero turns power off; turning on with a percentage sends power
-before speed. Optional enum and timer bindings extend the same device:
+before speed.
+
+Consecutive unsent writes to the bound speed mapping keep only the latest value.
+An in-flight write still completes its independent readback. Other property
+writes retain their order and separate speed updates, so coalescing cannot move
+a speed change across a power or mode change. This applies to both `miotSet` and
+channel commands while the fan binding is enabled.
+
+Optional enum and timer bindings extend the same device:
 
 ```text
 miotFanEnum preset ModeChannel Label...
@@ -131,8 +139,9 @@ is retained when the MCU reports it. A malformed multi-property notification is
 rejected as a whole. Unknown notifications are acknowledged and ignored.
 
 The driver bounds its mappings, queue, and line buffer. A full queue rejects a new
-write. A transaction timeout schedules a read without retrying the write, because
-an error can still have side effects. Partial or oversized frames are discarded
+entry but permits replacing its last unsent fan speed. A transaction timeout
+schedules a read without retrying the write, because an error can still have
+side effects. Partial or oversized frames are discarded
 through the next CR. An MCU `model` announcement clears queued pre-reset commands
 and schedules fresh reads. Periodic reads also refresh mapped state. Stopping the
 driver or handing its UART to another driver prevents further UART processing.
