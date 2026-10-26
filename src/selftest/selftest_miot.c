@@ -4,6 +4,7 @@
 #include "../driver/drv_miot.h"
 #include "../driver/drv_public.h"
 #include "../driver/drv_uart.h"
+#include "../mqtt/new_mqtt.h"
 #include "../quicktick.h"
 #include "selftest_local.h"
 
@@ -317,6 +318,72 @@ static void MIoT_TestFanDiscovery(void) {
 	CMD_ExecuteCommand("stopDriver MIoT", 0);
 }
 
+static void MIoT_TestFanPublishing(void) {
+	const char *topic = "miot-test/miot/fan/get";
+	const char *initial = "{\"power\":false,\"speed\":1,\"oscillation\":false,\"angle\":90}";
+	const char *confirmed = "{\"power\":false,\"speed\":37,\"oscillation\":false,\"angle\":90}";
+	mqtt_client_t *client;
+	SIM_ClearAndPrepareForMQTTTesting("miot-test", "bekens");
+	SIM_UART_InitReceiveRingBuffer(8192);
+	CMD_ExecuteCommand("startDriver MIoT", 0);
+	CMD_ExecuteCommand("miotMap 2 1 1 bool 0 1 1", 0);
+	CMD_ExecuteCommand("miotMap 2 5 2 int 1 100 1", 0);
+	CMD_ExecuteCommand("miotMap 2 6 3 bool 0 1 1", 0);
+	CMD_ExecuteCommand("miotMap 2 7 4 int 30 150 1 30", 0);
+	CMD_ExecuteCommand("miotFan 1 2 3 4", 0);
+	MIoT_TestReceive("get_down\rresult 2 1 0 false\rget_down\rresult 2 5 0 1\rget_down\rresult 2 6 0 false\rget_down\rresult 2 7 0 90\r");
+	MIoT_TestExpect("down get_properties 2 1\rok\rdown get_properties 2 5\rok\rdown get_properties 2 6\rok\rdown get_properties 2 7\rok\r");
+	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR(topic, initial, true);
+	SIM_ClearMQTTHistory();
+
+	// A network command and its write acknowledgment are not confirmed state.
+	MQTT_Post_Received_Str("cmnd/miot-test/miotSet", "2 5 37");
+	MQTT_RunQuickTick();
+	SELFTEST_ASSERT(SIM_GetMQTTHistoryString(topic, false) == NULL);
+	MIoT_TestReceive("get_down\rresult 2 5 0\r");
+	MIoT_TestExpect("down set_properties 2 5 37\rok\r");
+	SELFTEST_ASSERT(SIM_GetMQTTHistoryString(topic, false) == NULL);
+	MIoT_TestReceive("get_down\rresult 2 5 0 37\r");
+	MIoT_TestExpect("down get_properties 2 5\rok\r");
+	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR(topic, confirmed, true);
+	SIM_ClearMQTTHistory();
+
+	// Successful-but-ignored writes promptly republish the actual readback value.
+	CMD_ExecuteCommand("miotSet 2 5 100", 0);
+	MIoT_TestReceive("get_down\rresult 2 5 0\rget_down\rresult 2 5 0 37\r");
+	MIoT_TestExpect("down set_properties 2 5 100\rok\rdown get_properties 2 5\rok\r");
+	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR(topic, confirmed, true);
+	SELFTEST_ASSERT(!SIM_CheckMQTTHistoryForString(topic, "{\"power\":false,\"speed\":100,\"oscillation\":false,\"angle\":90}", true));
+	SIM_ClearMQTTHistory();
+
+	// Multiple frames in one tick publish only the final, fully validated snapshot.
+	MIoT_TestReceive("properties_changed 2 5 58\rproperties_changed 2 1 true 2 6 true\r");
+	MIoT_TestExpect("ok\rok\r");
+	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR(topic, "{\"power\":true,\"speed\":58,\"oscillation\":true,\"angle\":90}", true);
+	SELFTEST_ASSERT(!SIM_CheckMQTTHistoryForString(topic, "{\"power\":false,\"speed\":58,\"oscillation\":false,\"angle\":90}", true));
+	SELFTEST_ASSERT(!SIM_CheckMQTTHistoryForString(topic, "{\"power\":true,\"speed\":58,\"oscillation\":false,\"angle\":90}", true));
+	SIM_ClearMQTTHistory();
+	MIoT_TestReceive("properties_changed 2 1 false 2 5 invalid\r");
+	MIoT_TestExpect("error\r");
+	DRV_RunQuickTick();
+	MIoT_RunEverySecond();
+	SELFTEST_ASSERT(SIM_GetMQTTHistoryString(topic, false) == NULL);
+
+	// An unavailable broker leaves the latest state for the slow tick, without busy retries.
+	client = mqtt_client;
+	mqtt_client = NULL;
+	MIoT_TestReceive("properties_changed 2 5 75\rproperties_changed 2 5 100\r");
+	MIoT_TestExpect("ok\rok\r");
+	SELFTEST_ASSERT(SIM_GetMQTTHistoryString(topic, false) == NULL);
+	mqtt_client = client;
+	DRV_RunQuickTick();
+	SELFTEST_ASSERT(SIM_GetMQTTHistoryString(topic, false) == NULL);
+	MIoT_RunEverySecond();
+	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR(topic, "{\"power\":true,\"speed\":100,\"oscillation\":true,\"angle\":90}", true);
+	SELFTEST_ASSERT(!SIM_CheckMQTTHistoryForString(topic, "{\"power\":true,\"speed\":75,\"oscillation\":true,\"angle\":90}", true));
+	CMD_ExecuteCommand("stopDriver MIoT", 0);
+}
+
 static void MIoT_TestFanEnums(void) {
 	char name[64], topic[128];
 	SIM_ClearOBK(0);
@@ -373,15 +440,15 @@ static void MIoT_TestFanEnums(void) {
 	SELFTEST_ASSERT_JSON_VALUE_STRING(NULL, "cmd_tpl", "12 2 {{value|int}}");
 	SELFTEST_ASSERT_HAS_MQTT_JSON_SENT("homeassistant/sensor/miot-fan_sensor_0_r/config", false);
 	SELFTEST_ASSERT_JSON_VALUE_STRING(NULL, "unit_of_meas", "min");
+	SIM_ClearMQTTHistory();
 	MIoT_TestReceive("properties_changed 2 1 true 2 5 37 2 6 true 2 7 90 2 3 1\r");
 	MIoT_TestExpect("ok\r");
-	SIM_ClearMQTTHistory();
 	Sim_RunSeconds(2, false);
 	SELFTEST_ASSERT(SIM_GetMQTTHistoryString("miot-test/miot/fan/get", false) == NULL);
 	MIoT_TestReceive("properties_changed 2 4 4 12 2 2 12 3 2\r");
 	MIoT_TestExpect("ok\r");
-	Sim_RunSeconds(2, false);
 	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR("miot-test/miot/fan/get", "{\"power\":true,\"speed\":37,\"oscillation\":true,\"angle\":90,\"mode\":1,\"profile\":4,\"timer\":2,\"remaining\":2}", true);
+	Sim_RunSeconds(2, false);
 	CMD_ExecuteCommand("miotFan off", 0);
 	Sim_RunSeconds(7, false);
 	SELFTEST_ASSERT_HAD_MQTT_PUBLISH_STR("homeassistant/select/miot-fan_select_pr/config", "", true);
@@ -522,6 +589,7 @@ void Test_MIoT(void) {
 	SELFTEST_ASSERT_HAS_UART_EMPTY();
 	MIoT_TestNetworkReset();
 	MIoT_TestFanDiscovery();
+	MIoT_TestFanPublishing();
 	MIoT_TestFanEnums();
 }
 #endif

@@ -91,6 +91,10 @@ snapshot are republished after MQTT reconnect. `miotFan off` or stopping the
 driver removes its retained discovery and state; mappings and channel control
 remain available after `miotFan off`.
 
+Confirmed updates are coalesced into one snapshot at the end of the quick tick.
+The slow tick retries pending publication; periodic reads remain a recovery
+fallback. Commands and write acknowledgments alone do not trigger publication.
+
 MQTT availability describes the module's broker connection, not MCU or motor
 health. Until readback arrives, a retained snapshot represents the last known
 MCU state.

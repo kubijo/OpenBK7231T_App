@@ -70,7 +70,7 @@ static miotFanEnum_t fanMode, fanProfile;
 static bool MIoT_FanConfigFits(const int *indices, miotFanEnum_t *mode);
 static int fanTimerProperties[2];
 static bool fanTimer;
-static bool fanEnabled, fanDirty, fanMqttReady;
+static bool fanEnabled, fanDirty, fanMqttReady, fanPublishPending;
 static char fanDiscoveryTopic[64] = "homeassistant";
 
 static void MIoT_QueueFanDiscovery(const char *topic, const char *channel, const char *value) {
@@ -340,6 +340,9 @@ static void MIoT_ReadAll(void) {
 
 static void MIoT_ResetSession(void) {
 	int i;
+#if ENABLE_HA_DISCOVERY && ENABLE_MQTT
+	fanPublishPending = false;
+#endif
 	queueHead = queueCount = 0;
 	pending = MIOT_IDLE;
 	readbackProperty = -1;
@@ -375,7 +378,7 @@ static void MIoT_Apply(int index, int value) {
 	p->value = value;
 	p->reconcile = false;
 #if ENABLE_HA_DISCOVERY && ENABLE_MQTT
-	fanDirty = true;
+	fanDirty = fanPublishPending = true;
 #endif
 	applyingChannel = p->channel;
 	applyingValue = value;
@@ -603,6 +606,13 @@ void MIoT_RunFrame(void) {
 		} else if (!dropping)
 			line[lineLength++] = (char)c;
 	}
+#if ENABLE_HA_DISCOVERY && ENABLE_MQTT
+	// Coalesce confirmed updates after draining UART; the slow tick retries failures.
+	if (fanPublishPending) {
+		fanPublishPending = false;
+		MIoT_PublishFanState();
+	}
+#endif
 }
 
 #if ENABLE_HA_DISCOVERY && ENABLE_MQTT
